@@ -1,0 +1,18 @@
+# Cargo
+/target/
+
+# MSVC (Windows) debug symbols
+*.pdb
+
+# Local-only under priv (specs like plan.txt / TODO.md can be committed)
+/priv/local/
+
+# Secrets / local env
+.env
+.env.*
+/priv/
+
+# OS
+.DS_Store
+Thumbs.db
+
