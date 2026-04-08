@@ -14,6 +14,9 @@ pub enum Commands {
     /// Run the long-lived daemon (local socket + JSON-RPC).
     Daemon,
 
+    /// Stop the running daemon (SIGTERM on Unix; graceful `taskkill` on Windows).
+    Stop,
+
     /// Send a research request to the daemon (starts daemon if needed).
     Research {
         /// Search query

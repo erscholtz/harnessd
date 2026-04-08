@@ -1,5 +1,11 @@
+//! Local research harness: CLI, long-lived daemon, and Zed bridge (`harnessd --help`).
+#![warn(missing_docs)]
+
 mod cli;
 mod commands;
+mod daemon_lock;
+mod paths;
+mod shutdown;
 
 use anyhow::Context;
 use clap::Parser;
