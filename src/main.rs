@@ -1,23 +1,17 @@
 //! Local research harness: CLI, long-lived daemon, and Zed bridge (`harnessd --help`).
 #![warn(missing_docs)]
 
-mod cli;
-mod commands;
-mod daemon_lock;
-mod paths;
-mod shutdown;
-
 use anyhow::Context;
 use clap::Parser;
 
-use crate::cli::Cli;
+use harnessd::cli::Cli;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    commands::run(cli.command)
+    harnessd::commands::run(cli.command)
         .await
         .context("harnessd command failed")?;
 

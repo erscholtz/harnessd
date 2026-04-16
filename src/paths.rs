@@ -18,3 +18,13 @@ pub fn runtime_dir() -> PathBuf {
             .join(".local/share/harnessd")
     }
 }
+
+/// IPC socket path for Unix platforms.
+pub fn socket_path() -> PathBuf {
+    runtime_dir().join("daemon.sock")
+}
+
+/// IPC port file path for Windows loopback mode.
+pub fn port_file() -> PathBuf {
+    runtime_dir().join("daemon.port")
+}

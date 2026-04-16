@@ -3,8 +3,16 @@ name = "harnessd"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "harnessd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "harnessd"
+path = "src/main.rs"
+
 [dependencies]
-tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "io-util", "process", "signal"] }
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "io-util", "process", "signal", "time", "fs", "net"] }
 interprocess = { version = "2.4.0", features = ["tokio"] }
 tokio-util = { version = "0.7.18", features = ["codec"] }
 tokio-serde = { version = "0.9.0", features = ["json"] }
@@ -16,3 +24,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 dirs = "6.0.0"
 tree-sitter = "0.26.8"
+tree-sitter-rust = "0.24"
+tree-sitter-javascript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-typescript = "0.23"
+rusqlite = { version = "0.34", features = ["bundled"] }

@@ -6,7 +6,7 @@
 pub async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let mut sigterm = match signal(SignalKind::terminate()) {
             Ok(s) => s,

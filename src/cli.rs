@@ -3,7 +3,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "harnessd", version, about = "Local research harness (daemon + CLI + Zed bridge)")]
+#[command(
+    name = "harnessd",
+    version,
+    about = "Local research harness (daemon + CLI + Zed bridge)"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -16,6 +20,26 @@ pub enum Commands {
 
     /// Stop the running daemon (SIGTERM on Unix; graceful `taskkill` on Windows).
     Stop,
+
+    /// Debug the autocomplete path by asking the daemon for completions.
+    Complete {
+        /// Absolute or workspace-relative file path.
+        #[arg(long)]
+        file: PathBuf,
+        /// Cursor position as a byte offset.
+        #[arg(long)]
+        offset: usize,
+        /// Optional prefix to filter suggestions.
+        #[arg(long)]
+        prefix: Option<String>,
+    },
+
+    /// Warm the proposal cache for a file or workspace path.
+    Prefetch {
+        /// File or directory to scan for anchors.
+        #[arg(long)]
+        path: PathBuf,
+    },
 
     /// Send a research request to the daemon (starts daemon if needed).
     Research {

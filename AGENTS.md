@@ -5,7 +5,7 @@ Use this when changing code or planning work. Detailed roadmap lives in **`priv/
 ## North star
 
 - **Autocomplete first**: daemon + **tree-sitter** + **proposal cache** + fast **`complete(file, cursor, …)`**. Cursor path = cache lookup when possible, not a full model round-trip every time.
-- **Background work** warms the cache (TODO/FIXME / `todo!()` / `unimplemented!()` first). **Research**, tmux, vector DB, Kimi/SSE, and heavy **index** are **later**; do not block autocomplete milestones on them.
+- **Background work** warms the cache (TODO/FIXME / `todo!()` / `unimplemented!()` first). **Research**, tmux, vector DB, codex/SSE, and heavy **index** are **later**; do not block autocomplete milestones on them.
 
 ## Architecture rules
 

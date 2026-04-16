@@ -57,8 +57,12 @@ fn read_pid(path: &Path) -> Option<u32> {
 /// Read PID from an existing lock file (for `stop`).
 pub fn read_daemon_pid(runtime_dir: &Path) -> anyhow::Result<u32> {
     let path = runtime_dir.join("daemon.lock");
-    let s = fs::read_to_string(&path)
-        .map_err(|_| anyhow::anyhow!("no daemon lock at {}; is the daemon running?", path.display()))?;
+    let s = fs::read_to_string(&path).map_err(|_| {
+        anyhow::anyhow!(
+            "no daemon lock at {}; is the daemon running?",
+            path.display()
+        )
+    })?;
     s.trim()
         .parse::<u32>()
         .map_err(|_| anyhow::anyhow!("invalid pid in {}", path.display()))
