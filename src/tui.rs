@@ -2,6 +2,7 @@
 
 use std::io::{self, Stdout};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -12,44 +13,82 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::dashboard::DashboardSnapshot;
 
+struct AppState {
+    snapshot: DashboardSnapshot,
+    selected_project: PathBuf,
+    recent_projects: Vec<PathBuf>,
+    overlay: OverlayState,
+    status_message: Option<StatusMessage>,
+}
+
+enum OverlayState {
+    None,
+    // Lightweight picker for switching between the current and recent roots.
+    ProjectPicker { selected: usize },
+    Browser(BrowserState),
+}
+
+struct BrowserState {
+    current_dir: PathBuf,
+    selected: usize,
+    entries: Vec<BrowserEntry>,
+}
+
+#[derive(Clone)]
+enum BrowserEntry {
+    UseCurrent,
+    Parent(PathBuf),
+    Directory(PathBuf),
+}
+
+#[derive(Clone)]
+enum ProjectOption {
+    Project(PathBuf),
+    Browse,
+}
+
+struct StatusMessage {
+    text: String,
+    color: Color,
+}
+
 /// Run the interactive dashboard until the user quits.
-pub async fn run() -> anyhow::Result<()> {
+pub async fn run(initial_project: Option<PathBuf>) -> anyhow::Result<()> {
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
-    let mut snapshot = crate::dashboard::collect().await;
+    let mut app = AppState::new(initial_project).await;
     let refresh_interval = Duration::from_secs(1);
     let poll_interval = Duration::from_millis(250);
     let mut last_refresh = Instant::now();
 
     loop {
         terminal
-            .draw(|frame| render(frame, &snapshot))
+            .draw(|frame| render(frame, &app))
             .context("failed to draw dashboard")?;
 
         if event::poll(poll_interval)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('r') => {
-                            snapshot = crate::dashboard::collect().await;
-                            last_refresh = Instant::now();
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        if handle_key_event(&mut app, key.code).await {
+                            break;
                         }
-                        _ => {}
+                        last_refresh = Instant::now();
                     }
                 }
+                _ => {}
             }
         }
 
         if last_refresh.elapsed() >= refresh_interval {
-            snapshot = crate::dashboard::collect().await;
+            app.refresh().await;
             last_refresh = Instant::now();
         }
     }
@@ -58,6 +97,58 @@ pub async fn run() -> anyhow::Result<()> {
     restore_terminal()?;
     crate::commands::teardown_runtime().await?;
     Ok(())
+}
+
+impl AppState {
+    async fn new(initial_project: Option<PathBuf>) -> Self {
+        let snapshot = crate::dashboard::collect().await;
+        let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let selected_project = normalize_project_path(initial_project.unwrap_or(fallback));
+        let recent_projects = load_recent_projects(&selected_project);
+
+        Self {
+            snapshot,
+            selected_project,
+            recent_projects,
+            overlay: OverlayState::None,
+            status_message: None,
+        }
+    }
+
+    async fn refresh(&mut self) {
+        self.snapshot = crate::dashboard::collect().await;
+    }
+
+    async fn choose_project(&mut self, project: PathBuf) {
+        let project = normalize_project_path(project);
+        match crate::commands::prefetch_runtime_path(&project).await {
+            Ok(result) => {
+                self.selected_project = project.clone();
+                self.recent_projects = push_recent_project(self.recent_projects.clone(), &project);
+                save_recent_projects(&self.recent_projects);
+                self.set_status(
+                    format!(
+                        "Parsed {} files, found {} anchors, stored {} proposals from {}",
+                        result.scanned_files,
+                        result.anchors_found,
+                        result.proposals_stored,
+                        project.display()
+                    ),
+                    Color::Green,
+                );
+                self.overlay = OverlayState::None;
+                self.refresh().await;
+            }
+            Err(error) => {
+                self.set_status(format!("Project selection failed: {error}"), Color::Red);
+                self.overlay = OverlayState::None;
+            }
+        }
+    }
+
+    fn set_status(&mut self, text: String, color: Color) {
+        self.status_message = Some(StatusMessage { text, color });
+    }
 }
 
 fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
@@ -74,13 +165,91 @@ fn restore_terminal() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn render(frame: &mut ratatui::Frame<'_>, snapshot: &DashboardSnapshot) {
+async fn handle_key_event(app: &mut AppState, key: KeyCode) -> bool {
+    let mut choose_project = None;
+    let mut open_browser = None;
+    let mut quit = false;
+
+    match &mut app.overlay {
+        OverlayState::ProjectPicker { selected } => {
+            let options = project_options(&app.selected_project, &app.recent_projects);
+            match key {
+                KeyCode::Esc => app.overlay = OverlayState::None,
+                KeyCode::Up => {
+                    if *selected > 0 {
+                        *selected -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if *selected + 1 < options.len() {
+                        *selected += 1;
+                    }
+                }
+                KeyCode::Enter => match options.get(*selected).cloned() {
+                    Some(ProjectOption::Project(path)) => choose_project = Some(path),
+                    Some(ProjectOption::Browse) => {
+                        open_browser = Some(app.selected_project.clone());
+                    }
+                    None => {}
+                },
+                _ => {}
+            }
+        }
+        OverlayState::Browser(browser) => match key {
+            KeyCode::Esc => app.overlay = OverlayState::None,
+            KeyCode::Up => {
+                if browser.selected > 0 {
+                    browser.selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if browser.selected + 1 < browser.entries.len() {
+                    browser.selected += 1;
+                }
+            }
+            KeyCode::Backspace | KeyCode::Left => {
+                if let Some(parent) = browser.current_dir.parent() {
+                    *browser = BrowserState::new(parent.to_path_buf());
+                }
+            }
+            KeyCode::Enter => match browser.entries.get(browser.selected).cloned() {
+                Some(BrowserEntry::UseCurrent) => {
+                    choose_project = Some(browser.current_dir.clone())
+                }
+                Some(BrowserEntry::Parent(path)) | Some(BrowserEntry::Directory(path)) => {
+                    *browser = BrowserState::new(path);
+                }
+                None => {}
+            },
+            _ => {}
+        },
+        OverlayState::None => match key {
+            KeyCode::Char('q') | KeyCode::Esc => quit = true,
+            KeyCode::Char('r') => app.refresh().await,
+            KeyCode::Char('p') => app.overlay = OverlayState::ProjectPicker { selected: 0 },
+            _ => {}
+        },
+    }
+
+    if let Some(path) = open_browser {
+        app.overlay = OverlayState::Browser(BrowserState::new(path));
+    }
+    if let Some(path) = choose_project {
+        app.choose_project(path).await;
+    }
+
+    quit
+}
+
+fn render(frame: &mut ratatui::Frame<'_>, app: &AppState) {
+    let snapshot = &app.snapshot;
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(10),
-            Constraint::Length(10),
+            Constraint::Length(5),
+            Constraint::Length(9),
+            Constraint::Length(9),
             Constraint::Min(8),
         ])
         .split(frame.area());
@@ -88,23 +257,34 @@ fn render(frame: &mut ratatui::Frame<'_>, snapshot: &DashboardSnapshot) {
     let top = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(root[1]);
+        .split(root[2]);
     let middle = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(root[2]);
+        .split(root[3]);
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-        .split(root[3]);
+        .split(root[4]);
 
     frame.render_widget(header(snapshot), root[0]);
+    frame.render_widget(project_panel(app), root[1]);
     frame.render_widget(daemon_panel(snapshot), top[0]);
     frame.render_widget(cache_panel(snapshot), top[1]);
     frame.render_widget(metrics_panel(snapshot), middle[0]);
     frame.render_widget(paths_panel(snapshot), middle[1]);
     frame.render_widget(recent_panel(snapshot), bottom[0]);
     frame.render_widget(help_panel(snapshot), bottom[1]);
+
+    match &app.overlay {
+        OverlayState::ProjectPicker { selected } => {
+            render_project_picker(frame, app, *selected);
+        }
+        OverlayState::Browser(browser) => {
+            render_browser(frame, browser);
+        }
+        OverlayState::None => {}
+    }
 }
 
 fn header(snapshot: &DashboardSnapshot) -> Paragraph<'static> {
@@ -137,6 +317,24 @@ fn header(snapshot: &DashboardSnapshot) -> Paragraph<'static> {
         )),
     ]))
     .block(Block::default().borders(Borders::ALL).title("Overview"))
+}
+
+fn project_panel(app: &AppState) -> Paragraph<'static> {
+    let mut lines = vec![
+        kv("Project", app.selected_project.display().to_string()),
+        Line::raw("Press p to choose a recent project or browse for a folder."),
+    ];
+
+    if let Some(status) = &app.status_message {
+        lines.push(Line::styled(
+            truncate(&status.text, 120),
+            Style::default().fg(status.color),
+        ));
+    }
+
+    Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Project"))
+        .wrap(Wrap { trim: true })
 }
 
 fn daemon_panel(snapshot: &DashboardSnapshot) -> Paragraph<'static> {
@@ -297,6 +495,7 @@ fn help_panel(snapshot: &DashboardSnapshot) -> Paragraph<'static> {
     let mut lines = vec![
         Line::raw("q / Esc  quit + teardown"),
         Line::raw("r        refresh now"),
+        Line::raw("p        choose project root"),
         Line::raw(""),
     ];
 
@@ -319,6 +518,63 @@ fn help_panel(snapshot: &DashboardSnapshot) -> Paragraph<'static> {
     Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title("Help"))
         .wrap(Wrap { trim: true })
+}
+
+fn render_project_picker(frame: &mut ratatui::Frame<'_>, app: &AppState, selected: usize) {
+    let area = centered_rect(72, 55, frame.area());
+    let options = project_options(&app.selected_project, &app.recent_projects);
+    let items: Vec<ListItem<'static>> = options
+        .iter()
+        .map(|option| match option {
+            ProjectOption::Project(path) => ListItem::new(path.display().to_string()),
+            ProjectOption::Browse => ListItem::new("Browse..."),
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Select Project"),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_browser(frame: &mut ratatui::Frame<'_>, browser: &BrowserState) {
+    let area = centered_rect(80, 70, frame.area());
+    let items: Vec<ListItem<'static>> = browser
+        .entries
+        .iter()
+        .map(|entry| ListItem::new(browser_entry_label(entry)))
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(browser.selected));
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Browse {}", browser.current_dir.display())),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn kv(label: &str, value: String) -> Line<'static> {
@@ -387,4 +643,119 @@ impl Drop for TerminalGuard {
             let _ = restore_terminal();
         }));
     }
+}
+
+impl BrowserState {
+    fn new(start_dir: PathBuf) -> Self {
+        let current_dir = normalize_project_path(start_dir);
+        let entries = browser_entries(&current_dir);
+        Self {
+            current_dir,
+            selected: 0,
+            entries,
+        }
+    }
+}
+
+fn project_options(selected_project: &Path, recent_projects: &[PathBuf]) -> Vec<ProjectOption> {
+    let mut options = vec![ProjectOption::Project(selected_project.to_path_buf())];
+    for path in recent_projects {
+        if path != selected_project {
+            options.push(ProjectOption::Project(path.clone()));
+        }
+    }
+    options.push(ProjectOption::Browse);
+    options
+}
+
+fn browser_entries(current_dir: &Path) -> Vec<BrowserEntry> {
+    let mut entries = vec![BrowserEntry::UseCurrent];
+    if let Some(parent) = current_dir.parent() {
+        entries.push(BrowserEntry::Parent(parent.to_path_buf()));
+    }
+
+    let mut directories: Vec<PathBuf> = std::fs::read_dir(current_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter_map(|entry| match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => Some(entry.path()),
+            _ => None,
+        })
+        .collect();
+    directories.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+    entries.extend(directories.into_iter().map(BrowserEntry::Directory));
+    entries
+}
+
+fn browser_entry_label(entry: &BrowserEntry) -> String {
+    match entry {
+        BrowserEntry::UseCurrent => "[Select this directory]".to_string(),
+        BrowserEntry::Parent(path) => format!("[..] {}", path.display()),
+        BrowserEntry::Directory(path) => {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("<dir>");
+            format!("{name}/")
+        }
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn normalize_project_path(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
+}
+
+fn load_recent_projects(selected_project: &Path) -> Vec<PathBuf> {
+    let path = crate::paths::recent_projects_path();
+    let recent = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<Vec<String>>(&contents).ok())
+        .unwrap_or_default();
+
+    // Keep the current project at the front so the picker always has a valid default.
+    push_recent_project(
+        recent.into_iter().map(PathBuf::from).collect(),
+        selected_project,
+    )
+}
+
+fn save_recent_projects(recent_projects: &[PathBuf]) {
+    let path = crate::paths::recent_projects_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let serializable: Vec<String> = recent_projects
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    if let Ok(json) = serde_json::to_string_pretty(&serializable) {
+        std::fs::write(path, json).ok();
+    }
+}
+
+fn push_recent_project(mut recent_projects: Vec<PathBuf>, project: &Path) -> Vec<PathBuf> {
+    recent_projects.retain(|path| path != project);
+    recent_projects.insert(0, project.to_path_buf());
+    recent_projects.truncate(8);
+    recent_projects
 }

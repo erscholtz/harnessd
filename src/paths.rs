@@ -7,15 +7,11 @@ use std::path::PathBuf;
 pub fn runtime_dir() -> PathBuf {
     #[cfg(windows)]
     {
-        dirs::data_local_dir()
-            .expect("LOCALAPPDATA should be set on Windows")
-            .join("harnessd")
+        runtime_root()
     }
     #[cfg(unix)]
     {
-        dirs::home_dir()
-            .expect("HOME should be set")
-            .join(".local/share/harnessd")
+        runtime_root()
     }
 }
 
@@ -27,4 +23,23 @@ pub fn socket_path() -> PathBuf {
 /// IPC port file path for Windows loopback mode.
 pub fn port_file() -> PathBuf {
     runtime_dir().join("daemon.port")
+}
+
+/// Recent project selections used by the TUI project picker.
+pub fn recent_projects_path() -> PathBuf {
+    runtime_dir().join("recent-projects.json")
+}
+
+#[cfg(windows)]
+fn runtime_root() -> PathBuf {
+    dirs::data_local_dir()
+        .expect("LOCALAPPDATA should be set on Windows")
+        .join("harnessd")
+}
+
+#[cfg(unix)]
+fn runtime_root() -> PathBuf {
+    dirs::home_dir()
+        .expect("HOME should be set")
+        .join(".local/share/harnessd")
 }

@@ -88,7 +88,9 @@ cargo run -- tui
 
 This opens a live terminal dashboard that polls the daemon for health, cache,
 IPC, and recent proposal information. It also shows local runtime/DB state when
-the daemon is offline.
+the daemon is offline. Inside the dashboard, press `p` to open the project
+picker, select a recent path from the dropdown-style list, or choose
+`Browse...` to walk directories and pick the root to prefetch.
 
 ### Lifecycle
 

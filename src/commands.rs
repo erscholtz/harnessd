@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -12,6 +12,7 @@ use crate::paths;
 use crate::rpc::{CompleteParams, JsonRpcRequest, PrefetchParams, PrefetchResult, StatusResult};
 use crate::runtime;
 
+/// Run the selected CLI subcommand.
 pub async fn run(command: Commands) -> anyhow::Result<()> {
     match command {
         Commands::Daemon => run_daemon().await,
@@ -19,7 +20,7 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
         Commands::Teardown => run_teardown().await,
         Commands::Doctor => run_doctor().await,
         Commands::Stop => run_stop().await,
-        Commands::Tui => crate::tui::run().await,
+        Commands::Tui => crate::tui::run(None).await,
         Commands::Complete {
             file,
             offset,
@@ -46,44 +47,46 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
     }
 }
 
+/// Tear down any running daemon and clean stale runtime files.
 pub async fn teardown_runtime() -> anyhow::Result<()> {
     run_teardown().await
+}
+
+/// Warm the proposal cache for a path selected from the dashboard.
+pub async fn prefetch_runtime_path(path: &Path) -> anyhow::Result<PrefetchResult> {
+    request_prefetch(path).await
 }
 
 async fn run_daemon() -> anyhow::Result<()> {
     let dir = paths::runtime_dir();
     cleanup_stale_runtime_state(&dir).await?;
-    let _lock = DaemonLock::acquire(&dir)
+    let lock = DaemonLock::acquire(&dir)
         .with_context(|| format!("could not acquire daemon lock under {}", dir.display()))?;
 
     tracing::info!(
         runtime_dir = %dir.display(),
-        lock = %_lock.path().display(),
+        lock = %lock.path().display(),
         pid = std::process::id(),
         "daemon started — exit with Ctrl+C, SIGTERM (`kill`), or `harnessd stop`"
     );
 
-    // Initialize shared state (cache + parser)
+    // The daemon owns long-lived state so requests can stay on the local fast path.
     let state = crate::state::DaemonState::new(dir.clone())?;
 
-    // Create shutdown channel for coordinated shutdown
     let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
     let shutdown_tx_clone = shutdown_tx.clone();
 
-    // Spawn shutdown signal handler
     let shutdown_handle = tokio::spawn(async move {
         crate::shutdown::wait_for_shutdown().await;
         let _ = shutdown_tx_clone.send(()).await;
     });
 
-    // Start IPC server
     let ipc_handle = tokio::spawn(async move {
         if let Err(e) = crate::ipc::serve(state, shutdown_tx, shutdown_rx).await {
             tracing::error!(error = %e, "IPC server error");
         }
     });
 
-    // Wait for either task to complete (shutdown signal or IPC error)
     tokio::select! {
         _ = shutdown_handle => {
             tracing::info!("shutdown signal received");
@@ -115,12 +118,7 @@ async fn run_setup(path: Option<&Path>, no_tui: bool) -> anyhow::Result<()> {
     }
 
     // `status` verifies that IPC is up and the daemon state opened the cache DB.
-    let request = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        method: "status".to_string(),
-        params: None,
-        id: Some(serde_json::json!(1)),
-    };
+    let request = rpc_request::<serde_json::Value>("status", None)?;
     let status =
         read_status_response(&send_rpc_request_once(&serde_json::to_string(&request)?).await?)?;
     if let Some(path) = path {
@@ -131,7 +129,7 @@ async fn run_setup(path: Option<&Path>, no_tui: bool) -> anyhow::Result<()> {
     }
 
     if !no_tui {
-        crate::tui::run().await?;
+        crate::tui::run(path.map(PathBuf::from)).await?;
     }
 
     Ok(())
@@ -232,29 +230,25 @@ async fn run_research(query: &str, manual: Option<&Path>) -> anyhow::Result<()> 
 }
 
 async fn run_complete(file: &Path, offset: usize, prefix: Option<&str>) -> anyhow::Result<()> {
-    let request = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        method: "complete".to_string(),
-        params: Some(serde_json::to_value(CompleteParams {
-            file: file.canonicalize()?.to_string_lossy().to_string(),
+    let request = rpc_request(
+        "complete",
+        Some(CompleteParams {
+            file: canonicalize_rpc_path(file)?,
             offset,
             prefix: prefix.map(str::to_string),
-        })?),
-        id: Some(serde_json::json!(1)),
-    };
+        }),
+    )?;
     println!("{}", send_rpc_request(&request).await?);
     Ok(())
 }
 
 async fn run_prefetch(path: &Path) -> anyhow::Result<()> {
-    let request = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        method: "prefetch".to_string(),
-        params: Some(serde_json::to_value(PrefetchParams {
-            path: path.canonicalize()?.to_string_lossy().to_string(),
-        })?),
-        id: Some(serde_json::json!(1)),
-    };
+    let request = rpc_request(
+        "prefetch",
+        Some(PrefetchParams {
+            path: canonicalize_rpc_path(path)?,
+        }),
+    )?;
     println!("{}", send_rpc_request(&request).await?);
     Ok(())
 }
@@ -285,35 +279,31 @@ fn build_zed_request(
                 .context("`--cursor` is required for `zed-bridge --method complete`")?
                 .parse::<usize>()
                 .context("`--cursor` must be a byte offset for `complete`")?;
-            Ok(JsonRpcRequest {
-                jsonrpc: "2.0".to_string(),
-                method: method.to_string(),
-                params: Some(serde_json::to_value(CompleteParams {
-                    file: file.canonicalize()?.to_string_lossy().to_string(),
+            rpc_request(
+                method,
+                Some(CompleteParams {
+                    file: canonicalize_rpc_path(file)?,
                     offset: cursor,
                     prefix: None,
-                })?),
-                id: Some(serde_json::json!(1)),
-            })
+                }),
+            )
         }
         "prefetch" => {
             let file_or_dir =
                 file.context("`--file` is required for `zed-bridge --method prefetch`")?;
-            Ok(JsonRpcRequest {
-                jsonrpc: "2.0".to_string(),
-                method: method.to_string(),
-                params: Some(serde_json::to_value(PrefetchParams {
-                    path: file_or_dir.canonicalize()?.to_string_lossy().to_string(),
-                })?),
-                id: Some(serde_json::json!(1)),
-            })
+            rpc_request(
+                method,
+                Some(PrefetchParams {
+                    path: canonicalize_rpc_path(file_or_dir)?,
+                }),
+            )
         }
         _ => {
             let mut data = serde_json::Map::new();
             if let Some(file) = file {
                 data.insert(
                     "file".to_string(),
-                    serde_json::Value::String(file.canonicalize()?.to_string_lossy().to_string()),
+                    serde_json::Value::String(canonicalize_rpc_path(file)?),
                 );
             }
             if let Some(line) = line {
@@ -322,12 +312,7 @@ fn build_zed_request(
             if let Some(cursor) = cursor {
                 data.insert("cursor".to_string(), serde_json::json!(cursor));
             }
-            Ok(JsonRpcRequest {
-                jsonrpc: "2.0".to_string(),
-                method: method.to_string(),
-                params: Some(serde_json::Value::Object(data)),
-                id: Some(serde_json::json!(1)),
-            })
+            rpc_request(method, Some(serde_json::Value::Object(data)))
         }
     }
 }
@@ -388,14 +373,12 @@ fn read_status_response(response: &str) -> anyhow::Result<StatusResult> {
 }
 
 async fn request_prefetch(path: &Path) -> anyhow::Result<PrefetchResult> {
-    let request = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        method: "prefetch".to_string(),
-        params: Some(serde_json::to_value(PrefetchParams {
-            path: path.canonicalize()?.to_string_lossy().to_string(),
-        })?),
-        id: Some(serde_json::json!(1)),
-    };
+    let request = rpc_request(
+        "prefetch",
+        Some(PrefetchParams {
+            path: canonicalize_rpc_path(path)?,
+        }),
+    )?;
     let response = send_rpc_request(&request).await?;
     let response: crate::rpc::JsonRpcResponse = serde_json::from_str(&response)
         .with_context(|| format!("invalid prefetch response: {response}"))?;
@@ -437,12 +420,7 @@ fn print_setup_summary(status: &StatusResult, prefetch: Option<(&Path, &Prefetch
 }
 
 async fn request_daemon_shutdown() -> anyhow::Result<bool> {
-    let request = JsonRpcRequest {
-        jsonrpc: "2.0".to_string(),
-        method: "shutdown".to_string(),
-        params: None,
-        id: Some(serde_json::json!(1)),
-    };
+    let request = rpc_request::<serde_json::Value>("shutdown", None)?;
     let payload = serde_json::to_string(&request)?;
     match send_rpc_request_once(&payload).await {
         Ok(_) => Ok(true),
@@ -482,6 +460,8 @@ fn daemon_executable_path(current_exe: &Path) -> anyhow::Result<std::path::PathB
     {
         let runtime_dir = paths::runtime_dir();
         std::fs::create_dir_all(&runtime_dir)?;
+        // Windows keeps the running executable locked, so the daemon starts
+        // from a disposable copy inside the runtime directory.
         let daemon_copy = runtime_dir.join("harnessd-daemon.exe");
         std::fs::copy(current_exe, &daemon_copy).with_context(|| {
             format!(
@@ -556,4 +536,20 @@ async fn cleanup_stale_runtime_state(runtime_dir: &Path) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn rpc_request<T>(method: &str, params: Option<T>) -> anyhow::Result<JsonRpcRequest>
+where
+    T: serde::Serialize,
+{
+    Ok(JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        method: method.to_string(),
+        params: params.map(serde_json::to_value).transpose()?,
+        id: Some(serde_json::json!(1)),
+    })
+}
+
+fn canonicalize_rpc_path(path: &Path) -> anyhow::Result<String> {
+    Ok(path.canonicalize()?.to_string_lossy().to_string())
 }
