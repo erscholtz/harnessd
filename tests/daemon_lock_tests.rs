@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use harnessd::daemon_lock::{DaemonLock, read_daemon_pid};
+use harnessd::daemon_lock::{DaemonLock, read_daemon_pid, remove_stale_lock};
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -116,5 +116,20 @@ fn test_daemon_lock_creates_runtime_dir() {
 
     // Cleanup
     drop(lock);
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[test]
+fn test_remove_stale_lock_deletes_dead_pid() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).expect("failed to create runtime dir");
+
+    let lock_path = runtime_dir.join("daemon.lock");
+    std::fs::write(&lock_path, "999999\n").expect("failed to write stale lock");
+
+    let removed = remove_stale_lock(&runtime_dir).expect("failed to inspect stale lock");
+    assert!(removed);
+    assert!(!lock_path.exists());
+
     std::fs::remove_dir_all(&runtime_dir).ok();
 }

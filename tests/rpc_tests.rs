@@ -1,6 +1,9 @@
 //! Integration tests for the RPC module.
 
-use harnessd::rpc::{CompleteParams, JsonRpcRequest, JsonRpcResponse, PrefetchParams};
+use harnessd::rpc::{
+    CacheStatus, CompleteParams, DaemonMetricsSnapshot, JsonRpcRequest, JsonRpcResponse,
+    PrefetchParams, RecentProposal, StatusResult,
+};
 
 #[test]
 fn test_json_rpc_request_deserialization() {
@@ -192,4 +195,60 @@ fn test_prefetch_params_serialization() {
 
     let json = serde_json::to_string(&params).expect("failed to serialize");
     assert!(json.contains("/workspace"));
+}
+
+#[test]
+fn test_status_result_serialization() {
+    let status = StatusResult {
+        pid: 42,
+        runtime_dir: "/tmp/harnessd".to_string(),
+        ipc_endpoint: "/tmp/harnessd/daemon.sock".to_string(),
+        cache_db_path: "/tmp/harnessd/proposals.db".to_string(),
+        started_at: 1,
+        uptime_secs: 2,
+        metrics: DaemonMetricsSnapshot {
+            total_requests: 3,
+            complete_requests: 1,
+            prefetch_requests: 1,
+            status_requests: 1,
+            shutdown_requests: 0,
+            last_request_at: Some(4),
+        },
+        cache: CacheStatus {
+            total_proposals: 5,
+            total_bytes: 128,
+            db_file_size_bytes: 4096,
+            oldest_timestamp: Some(10),
+            newest_timestamp: Some(20),
+            max_lines: 20,
+            max_bytes: 2048,
+        },
+        runtime: harnessd::runtime::RuntimeHealth {
+            runtime_dir: "/tmp/harnessd".to_string(),
+            lock_path: "/tmp/harnessd/daemon.lock".to_string(),
+            lock_exists: true,
+            lock_pid: Some(42),
+            stale_lock: false,
+            port_file_path: "/tmp/harnessd/daemon.port".to_string(),
+            port_file_exists: false,
+            stale_port_file: false,
+            endpoint_reachable: true,
+            warnings: vec![],
+        },
+        recent_proposals: vec![RecentProposal {
+            label: "Implement TODO".to_string(),
+            file_path: "/tmp/harnessd/src/main.rs".to_string(),
+            byte_start: 10,
+            byte_end: 20,
+            created_at: 30,
+            snippet_preview: "todo!(\"demo\");".to_string(),
+            snippet_bytes: 15,
+        }],
+    };
+
+    let json = serde_json::to_string(&status).expect("failed to serialize status");
+    assert!(json.contains("\"pid\":42"));
+    assert!(json.contains("\"total_proposals\":5"));
+    assert!(json.contains("\"runtime\""));
+    assert!(json.contains("\"recent_proposals\""));
 }

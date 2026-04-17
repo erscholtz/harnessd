@@ -251,6 +251,34 @@ impl ProposalCache {
             newest_timestamp: newest,
         })
     }
+
+    /// Return the most recent proposals in descending timestamp order.
+    pub async fn recent(&self, limit: usize) -> anyhow::Result<Vec<Proposal>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, file_path, byte_start, byte_end, content_hash, snippet, label, created_at
+             FROM proposals
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?1",
+        )?;
+
+        let proposals = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(Proposal {
+                    id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    byte_start: row.get::<_, i64>(2)? as usize,
+                    byte_end: row.get::<_, i64>(3)? as usize,
+                    content_hash: row.get(4)?,
+                    snippet: row.get(5)?,
+                    label: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(proposals)
+    }
 }
 
 /// Cache statistics for diagnostics.

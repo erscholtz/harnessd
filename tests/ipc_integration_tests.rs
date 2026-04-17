@@ -109,3 +109,40 @@ async fn prefetch_populates_cache_for_python_complete() {
 
     std::fs::remove_dir_all(&runtime_dir).ok();
 }
+
+#[tokio::test]
+async fn status_reports_cache_and_request_metrics() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).expect("failed to create runtime dir");
+
+    let file_path = runtime_dir.join("fixture.rs");
+    let source = r#"fn demo() {
+    // TODO: implement demo
+}
+"#;
+    std::fs::write(&file_path, source).expect("failed to write fixture");
+
+    let state = DaemonState::new(runtime_dir.clone()).expect("failed to create daemon state");
+
+    ipc::prefetch(
+        &state,
+        &PrefetchParams {
+            path: file_path.to_string_lossy().to_string(),
+        },
+    )
+    .await
+    .expect("prefetch failed");
+    state.record_request("prefetch");
+
+    let status = ipc::status(&state).await.expect("status failed");
+
+    assert_eq!(status.pid, std::process::id());
+    assert_eq!(status.cache.total_proposals, 1);
+    assert_eq!(status.metrics.prefetch_requests, 1);
+    assert!(!status.runtime.stale_lock);
+    assert!(status.runtime.warnings.is_empty());
+    assert!(!status.recent_proposals.is_empty());
+    assert_eq!(status.recent_proposals[0].label, "Implement TODO");
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}

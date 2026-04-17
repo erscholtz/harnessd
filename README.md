@@ -80,6 +80,33 @@ cargo build
 cargo run
 ```
 
+### Dashboard
+
+```bash
+cargo run -- tui
+```
+
+This opens a live terminal dashboard that polls the daemon for health, cache,
+IPC, and recent proposal information. It also shows local runtime/DB state when
+the daemon is offline.
+
+### Lifecycle
+
+```bash
+cargo run -- setup --path .
+cargo run -- setup --no-tui
+cargo run -- teardown
+cargo run -- doctor
+```
+
+`setup` creates the runtime dir, starts the daemon if needed, waits for IPC
+readiness, verifies the cache/database state through `status`, and optionally
+warms the cache with `prefetch`, then opens the dashboard by default. Use
+`--no-tui` when you only want the bootstrap step. `teardown` stops the daemon
+and waits for the lock and IPC endpoint to disappear cleanly. `doctor` reports
+stale lock/port files and other common runtime mismatches in a user-facing
+format.
+
 ### Test
 
 ```bash
@@ -115,4 +142,3 @@ As you refine requirements, we can fold them into:
 - a short feature list
 - concrete usage examples
 - a simple roadmap (if you want one)
-

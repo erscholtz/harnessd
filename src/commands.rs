@@ -9,12 +9,17 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::cli::Commands;
 use crate::daemon_lock::{DaemonLock, read_daemon_pid};
 use crate::paths;
-use crate::rpc::{CompleteParams, JsonRpcRequest, PrefetchParams};
+use crate::rpc::{CompleteParams, JsonRpcRequest, PrefetchParams, PrefetchResult, StatusResult};
+use crate::runtime;
 
 pub async fn run(command: Commands) -> anyhow::Result<()> {
     match command {
         Commands::Daemon => run_daemon().await,
-        Commands::Stop => run_stop(),
+        Commands::Setup { path, no_tui } => run_setup(path.as_deref(), no_tui).await,
+        Commands::Teardown => run_teardown().await,
+        Commands::Doctor => run_doctor().await,
+        Commands::Stop => run_stop().await,
+        Commands::Tui => crate::tui::run().await,
         Commands::Complete {
             file,
             offset,
@@ -41,8 +46,13 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
     }
 }
 
+pub async fn teardown_runtime() -> anyhow::Result<()> {
+    run_teardown().await
+}
+
 async fn run_daemon() -> anyhow::Result<()> {
     let dir = paths::runtime_dir();
+    cleanup_stale_runtime_state(&dir).await?;
     let _lock = DaemonLock::acquire(&dir)
         .with_context(|| format!("could not acquire daemon lock under {}", dir.display()))?;
 
@@ -68,7 +78,7 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     // Start IPC server
     let ipc_handle = tokio::spawn(async move {
-        if let Err(e) = crate::ipc::serve(state, shutdown_rx).await {
+        if let Err(e) = crate::ipc::serve(state, shutdown_tx, shutdown_rx).await {
             tracing::error!(error = %e, "IPC server error");
         }
     });
@@ -87,9 +97,53 @@ async fn run_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn run_setup(path: Option<&Path>, no_tui: bool) -> anyhow::Result<()> {
+    let runtime_dir = paths::runtime_dir();
+    tokio::fs::create_dir_all(&runtime_dir)
+        .await
+        .with_context(|| format!("failed to create runtime dir {}", runtime_dir.display()))?;
+    cleanup_stale_runtime_state(&runtime_dir).await?;
+
+    if daemon_ready().await {
+        tracing::info!(runtime_dir = %runtime_dir.display(), "daemon already running");
+    } else {
+        tracing::info!(runtime_dir = %runtime_dir.display(), "starting daemon");
+        start_daemon()?;
+        wait_for_daemon_ready(Duration::from_secs(5))
+            .await
+            .with_context(|| runtime::render_report(&runtime::inspect(&runtime_dir, false)))?;
+    }
+
+    // `status` verifies that IPC is up and the daemon state opened the cache DB.
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        method: "status".to_string(),
+        params: None,
+        id: Some(serde_json::json!(1)),
+    };
+    let status =
+        read_status_response(&send_rpc_request_once(&serde_json::to_string(&request)?).await?)?;
+    if let Some(path) = path {
+        let prefetch = request_prefetch(path).await?;
+        print_setup_summary(&status, Some((path, &prefetch)));
+    } else {
+        print_setup_summary(&status, None);
+    }
+
+    if !no_tui {
+        crate::tui::run().await?;
+    }
+
+    Ok(())
+}
+
 /// Ask the running daemon to exit gracefully (SIGTERM on Unix; `taskkill` without `/F` on Windows).
-fn run_stop() -> anyhow::Result<()> {
+async fn run_stop() -> anyhow::Result<()> {
     let dir = paths::runtime_dir();
+    if request_daemon_shutdown().await? {
+        wait_for_daemon_shutdown(Duration::from_secs(5)).await?;
+        return Ok(());
+    }
     let pid = read_daemon_pid(&dir)?;
     let lock_path = dir.join("daemon.lock");
 
@@ -104,6 +158,7 @@ fn run_stop() -> anyhow::Result<()> {
 
         if status.success() {
             tracing::info!(pid, "sent SIGTERM to daemon");
+            wait_for_daemon_shutdown(Duration::from_secs(5)).await?;
             return Ok(());
         }
 
@@ -129,15 +184,36 @@ fn run_stop() -> anyhow::Result<()> {
 
         if status.success() {
             tracing::info!(pid, "requested graceful stop via taskkill");
+            wait_for_daemon_shutdown(Duration::from_secs(5)).await?;
             return Ok(());
         }
 
         // 128 = not running (typical for stale pid file)
         std::fs::remove_file(&lock_path).ok();
         anyhow::bail!(
-            "taskkill failed ({status}). If the daemon is not running, stale lock file was removed if present."
+            "taskkill failed ({status}). The daemon may require forceful termination; stale lock file was removed if present."
         );
     }
+}
+
+async fn run_teardown() -> anyhow::Result<()> {
+    let runtime_dir = paths::runtime_dir();
+
+    if !runtime_dir.join("daemon.lock").exists() {
+        cleanup_stale_runtime_state(&runtime_dir).await?;
+        tracing::info!(runtime_dir = %runtime_dir.display(), "daemon is not running");
+        return Ok(());
+    }
+
+    run_stop().await
+}
+
+async fn run_doctor() -> anyhow::Result<()> {
+    let runtime_dir = paths::runtime_dir();
+    let endpoint_reachable = daemon_ready().await;
+    let health = runtime::inspect(&runtime_dir, endpoint_reachable);
+    println!("{}", runtime::render_report(&health));
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -263,8 +339,13 @@ async fn send_rpc_request(request: &JsonRpcRequest) -> anyhow::Result<String> {
         Ok(response) => Ok(response),
         Err(first_error) => {
             tracing::info!(error = %first_error, "daemon unavailable, starting a new instance");
+            cleanup_stale_runtime_state(&paths::runtime_dir()).await?;
             start_daemon()?;
-            wait_for_daemon_ready(Duration::from_secs(5)).await?;
+            wait_for_daemon_ready(Duration::from_secs(5))
+                .await
+                .with_context(|| {
+                    runtime::render_report(&runtime::inspect(&paths::runtime_dir(), false))
+                })?;
             send_rpc_request_once(&payload)
                 .await
                 .with_context(|| format!("request failed after daemon startup: {first_error}"))
@@ -294,6 +375,81 @@ async fn send_rpc_request_once(payload: &str) -> anyhow::Result<String> {
     }
 }
 
+fn read_status_response(response: &str) -> anyhow::Result<StatusResult> {
+    let response: crate::rpc::JsonRpcResponse = serde_json::from_str(response)
+        .with_context(|| format!("invalid status response: {response}"))?;
+    if let Some(error) = response.error {
+        anyhow::bail!("status RPC failed: {} ({})", error.message, error.code);
+    }
+    let result = response
+        .result
+        .context("status response was missing `result`")?;
+    Ok(serde_json::from_value(result)?)
+}
+
+async fn request_prefetch(path: &Path) -> anyhow::Result<PrefetchResult> {
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        method: "prefetch".to_string(),
+        params: Some(serde_json::to_value(PrefetchParams {
+            path: path.canonicalize()?.to_string_lossy().to_string(),
+        })?),
+        id: Some(serde_json::json!(1)),
+    };
+    let response = send_rpc_request(&request).await?;
+    let response: crate::rpc::JsonRpcResponse = serde_json::from_str(&response)
+        .with_context(|| format!("invalid prefetch response: {response}"))?;
+    if let Some(error) = response.error {
+        anyhow::bail!("prefetch RPC failed: {} ({})", error.message, error.code);
+    }
+    let result = response
+        .result
+        .context("prefetch response was missing `result`")?;
+    Ok(serde_json::from_value(result)?)
+}
+
+fn print_setup_summary(status: &StatusResult, prefetch: Option<(&Path, &PrefetchResult)>) {
+    println!(
+        "daemon ready: pid {} at {}",
+        status.pid, status.ipc_endpoint
+    );
+    println!(
+        "cache db: {} ({} proposals)",
+        status.cache_db_path, status.cache.total_proposals
+    );
+    if let Some((path, result)) = prefetch {
+        println!(
+            "prefetch: {} files, {} anchors, {} proposals from {}",
+            result.scanned_files,
+            result.anchors_found,
+            result.proposals_stored,
+            path.display()
+        );
+    }
+    println!(
+        "dashboard: {}",
+        if prefetch.is_some() {
+            "opening after prefetch"
+        } else {
+            "opening now"
+        }
+    );
+}
+
+async fn request_daemon_shutdown() -> anyhow::Result<bool> {
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        method: "shutdown".to_string(),
+        params: None,
+        id: Some(serde_json::json!(1)),
+    };
+    let payload = serde_json::to_string(&request)?;
+    match send_rpc_request_once(&payload).await {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
 async fn send_payload<S>(stream: S, payload: &str) -> anyhow::Result<String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -311,13 +467,35 @@ where
 
 fn start_daemon() -> anyhow::Result<()> {
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
-    let mut cmd = Command::new(current_exe);
+    let daemon_exe = daemon_executable_path(&current_exe)?;
+    let mut cmd = Command::new(daemon_exe);
     cmd.arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     cmd.spawn().context("failed to spawn daemon process")?;
     Ok(())
+}
+
+fn daemon_executable_path(current_exe: &Path) -> anyhow::Result<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        let runtime_dir = paths::runtime_dir();
+        std::fs::create_dir_all(&runtime_dir)?;
+        let daemon_copy = runtime_dir.join("harnessd-daemon.exe");
+        std::fs::copy(current_exe, &daemon_copy).with_context(|| {
+            format!(
+                "failed to prepare daemon executable copy at {}",
+                daemon_copy.display()
+            )
+        })?;
+        Ok(daemon_copy)
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(current_exe.to_path_buf())
+    }
 }
 
 async fn wait_for_daemon_ready(timeout: Duration) -> anyhow::Result<()> {
@@ -328,6 +506,19 @@ async fn wait_for_daemon_ready(timeout: Duration) -> anyhow::Result<()> {
         }
         if start.elapsed() >= timeout {
             anyhow::bail!("daemon did not become ready within {:?}", timeout);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_daemon_shutdown(timeout: Duration) -> anyhow::Result<()> {
+    let start = Instant::now();
+    loop {
+        if !daemon_ready().await && !paths::runtime_dir().join("daemon.lock").exists() {
+            return Ok(());
+        }
+        if start.elapsed() >= timeout {
+            anyhow::bail!("daemon did not shut down within {:?}", timeout);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -351,4 +542,18 @@ async fn daemon_ready() -> bool {
             Err(_) => false,
         }
     }
+}
+
+async fn cleanup_stale_runtime_state(runtime_dir: &Path) -> anyhow::Result<()> {
+    let initial = runtime::inspect(runtime_dir, daemon_ready().await);
+    let cleaned = runtime::cleanup_stale_files(runtime_dir, initial.endpoint_reachable)?;
+    if initial.stale_lock && !cleaned.lock_exists {
+        tracing::warn!(runtime_dir = %runtime_dir.display(), "removed stale daemon lock");
+    }
+    #[cfg(windows)]
+    if initial.stale_port_file && !cleaned.port_file_exists {
+        tracing::warn!(runtime_dir = %runtime_dir.display(), "removed stale daemon port file");
+    }
+
+    Ok(())
 }

@@ -11,13 +11,14 @@ use tokio::sync::mpsc;
 use crate::parser::{AnchorKind, LanguageParsers, SupportedLanguage};
 use crate::rpc::{
     CompleteParams, CompletionSuggestion, JsonRpcRequest, JsonRpcResponse, PrefetchParams,
-    PrefetchResult,
+    PrefetchResult, StatusResult,
 };
 use crate::state::DaemonState;
 
 /// Start the IPC server and listen for JSON-RPC connections.
 pub async fn serve(
     state: Arc<DaemonState>,
+    shutdown_tx: mpsc::Sender<()>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) -> anyhow::Result<()> {
     let socket_path = state.runtime_dir.join("daemon.sock");
@@ -43,7 +44,8 @@ pub async fn serve(
                     match result {
                         Ok((stream, _)) => {
                             let state_clone = Arc::clone(&state);
-                            tokio::spawn(handle_connection(stream, state_clone));
+                            let shutdown_tx_clone = shutdown_tx.clone();
+                            tokio::spawn(handle_connection(stream, state_clone, shutdown_tx_clone));
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "failed to accept connection");
@@ -82,7 +84,8 @@ pub async fn serve(
                     match result {
                         Ok((stream, _)) => {
                             let state_clone = Arc::clone(&state);
-                            tokio::spawn(handle_connection(stream, state_clone));
+                            let shutdown_tx_clone = shutdown_tx.clone();
+                            tokio::spawn(handle_connection(stream, state_clone, shutdown_tx_clone));
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "failed to accept connection");
@@ -110,7 +113,7 @@ pub async fn serve(
 }
 
 /// Handle a single JSON-RPC connection.
-async fn handle_connection<S>(stream: S, state: Arc<DaemonState>)
+async fn handle_connection<S>(stream: S, state: Arc<DaemonState>, shutdown_tx: mpsc::Sender<()>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -123,7 +126,7 @@ where
         match reader.read_line(&mut line).await {
             Ok(0) => break, // EOF
             Ok(_) => {
-                let response = process_request(&line, &state).await;
+                let response = process_request(&line, &state, &shutdown_tx).await;
                 if let Err(e) = writer.write_all(response.as_bytes()).await {
                     tracing::warn!(error = %e, "failed to write response");
                     break;
@@ -142,7 +145,11 @@ where
 }
 
 /// Process a single JSON-RPC request and return the response as a string.
-async fn process_request(line: &str, state: &Arc<DaemonState>) -> String {
+async fn process_request(
+    line: &str,
+    state: &Arc<DaemonState>,
+    shutdown_tx: &mpsc::Sender<()>,
+) -> String {
     let request: JsonRpcRequest = match serde_json::from_str(line.trim()) {
         Ok(req) => req,
         Err(e) => {
@@ -152,10 +159,13 @@ async fn process_request(line: &str, state: &Arc<DaemonState>) -> String {
     };
 
     let id = request.id.clone();
+    state.record_request(&request.method);
 
     match request.method.as_str() {
         "complete" => handle_complete(request, state).await,
         "prefetch" => handle_prefetch(request, state).await,
+        "status" => handle_status(request, state).await,
+        "shutdown" => handle_shutdown(request, shutdown_tx).await,
         _ => JsonRpcResponse::error(
             id,
             -32601,
@@ -215,6 +225,21 @@ async fn handle_prefetch(request: JsonRpcRequest, state: &Arc<DaemonState>) -> J
         Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
         Err(e) => JsonRpcResponse::error(request.id, -32000, format!("Prefetch failed: {e}"), None),
     }
+}
+
+async fn handle_status(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcResponse {
+    match status(state).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => JsonRpcResponse::error(request.id, -32000, format!("Status failed: {e}"), None),
+    }
+}
+
+async fn handle_shutdown(
+    request: JsonRpcRequest,
+    shutdown_tx: &mpsc::Sender<()>,
+) -> JsonRpcResponse {
+    let _ = shutdown_tx.send(()).await;
+    JsonRpcResponse::success(request.id, serde_json::json!({ "ok": true }))
 }
 
 /// Compute suggestions for a file and byte offset using the cached fast path.
@@ -358,6 +383,11 @@ pub async fn prefetch(
         anchors_found,
         proposals_stored,
     })
+}
+
+/// Return a snapshot of daemon status for dashboards and diagnostics.
+pub async fn status(state: &Arc<DaemonState>) -> anyhow::Result<StatusResult> {
+    state.status_snapshot().await
 }
 
 fn proposals_to_suggestions(

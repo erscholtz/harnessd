@@ -30,3 +30,5 @@ tree-sitter-python = "0.23"
 tree-sitter-go = "0.23"
 tree-sitter-typescript = "0.23"
 rusqlite = { version = "0.34", features = ["bundled"] }
+crossterm = "0.29"
+ratatui = "0.29"

@@ -41,6 +41,26 @@ impl DaemonLock {
     }
 }
 
+/// Remove a stale daemon lock if its pid no longer exists.
+pub fn remove_stale_lock(runtime_dir: &Path) -> anyhow::Result<bool> {
+    let path = runtime_dir.join("daemon.lock");
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let Some(pid) = read_pid(&path) else {
+        fs::remove_file(&path)?;
+        return Ok(true);
+    };
+
+    if process_is_running(pid) {
+        return Ok(false);
+    }
+
+    fs::remove_file(&path)?;
+    Ok(true)
+}
+
 impl Drop for DaemonLock {
     fn drop(&mut self) {
         if let Err(e) = fs::remove_file(&self.path) {
@@ -49,7 +69,7 @@ impl Drop for DaemonLock {
     }
 }
 
-fn read_pid(path: &Path) -> Option<u32> {
+pub fn read_pid(path: &Path) -> Option<u32> {
     let s = fs::read_to_string(path).ok()?;
     s.trim().parse().ok()
 }
@@ -66,4 +86,25 @@ pub fn read_daemon_pid(runtime_dir: &Path) -> anyhow::Result<u32> {
     s.trim()
         .parse::<u32>()
         .map_err(|_| anyhow::anyhow!("invalid pid in {}", path.display()))
+}
+
+#[cfg(unix)]
+pub fn process_is_running(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+pub fn process_is_running(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}")])
+        .output()
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+        })
+        .unwrap_or(false)
 }

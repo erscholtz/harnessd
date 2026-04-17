@@ -18,8 +18,27 @@ pub enum Commands {
     /// Run the long-lived daemon (local socket + JSON-RPC).
     Daemon,
 
+    /// Initialize the runtime stack in order and verify the daemon is ready.
+    Setup {
+        /// Optional file or directory to prefetch once the daemon is up.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Skip launching the dashboard after setup completes.
+        #[arg(long, default_value_t = false)]
+        no_tui: bool,
+    },
+
+    /// Tear the runtime stack down gracefully and wait for shutdown.
+    Teardown,
+
+    /// Inspect runtime state and explain common startup/shutdown issues.
+    Doctor,
+
     /// Stop the running daemon (SIGTERM on Unix; graceful `taskkill` on Windows).
     Stop,
+
+    /// Open a live terminal dashboard for daemon and cache status.
+    Tui,
 
     /// Debug the autocomplete path by asking the daemon for completions.
     Complete {
