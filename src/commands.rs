@@ -21,6 +21,7 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
         Commands::Doctor => run_doctor().await,
         Commands::Stop => run_stop().await,
         Commands::Tui => crate::tui::run(None).await,
+        Commands::Lsp => crate::lsp::run_stdio().await,
         Commands::Complete {
             file,
             offset,
@@ -28,14 +29,14 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
         } => run_complete(&file, offset, prefix.as_deref()).await,
         Commands::Prefetch { path } => run_prefetch(&path).await,
         Commands::Research { query, manual } => run_research(&query, manual.as_deref()).await,
-        Commands::ZedBridge {
+        Commands::Bridge {
             method,
             file,
             line,
             text,
             cursor,
         } => {
-            run_zed_bridge(
+            run_bridge(
                 &method,
                 file.as_deref(),
                 line,
@@ -55,6 +56,15 @@ pub async fn teardown_runtime() -> anyhow::Result<()> {
 /// Warm the proposal cache for a path selected from the dashboard.
 pub async fn prefetch_runtime_path(path: &Path) -> anyhow::Result<PrefetchResult> {
     request_prefetch(path).await
+}
+
+/// Ask the daemon for cached completions for a file and byte offset.
+pub async fn complete_runtime_file(
+    file: &Path,
+    offset: usize,
+    prefix: Option<&str>,
+) -> anyhow::Result<Vec<crate::rpc::CompletionSuggestion>> {
+    request_complete(file, offset, prefix).await
 }
 
 async fn run_daemon() -> anyhow::Result<()> {
@@ -253,19 +263,19 @@ async fn run_prefetch(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_zed_bridge(
+async fn run_bridge(
     method: &str,
     file: Option<&Path>,
     line: Option<u32>,
     text: Option<&str>,
     cursor: Option<&str>,
 ) -> anyhow::Result<()> {
-    let request = build_zed_request(method, file, line, text, cursor)?;
+    let request = build_bridge_request(method, file, line, text, cursor)?;
     println!("{}", send_rpc_request(&request).await?);
     Ok(())
 }
 
-fn build_zed_request(
+fn build_bridge_request(
     method: &str,
     file: Option<&Path>,
     line: Option<u32>,
@@ -274,9 +284,9 @@ fn build_zed_request(
 ) -> anyhow::Result<JsonRpcRequest> {
     match method {
         "complete" => {
-            let file = file.context("`--file` is required for `zed-bridge --method complete`")?;
+            let file = file.context("`--file` is required for `bridge --method complete`")?;
             let cursor = cursor
-                .context("`--cursor` is required for `zed-bridge --method complete`")?
+                .context("`--cursor` is required for `bridge --method complete`")?
                 .parse::<usize>()
                 .context("`--cursor` must be a byte offset for `complete`")?;
             rpc_request(
@@ -290,7 +300,7 @@ fn build_zed_request(
         }
         "prefetch" => {
             let file_or_dir =
-                file.context("`--file` is required for `zed-bridge --method prefetch`")?;
+                file.context("`--file` is required for `bridge --method prefetch`")?;
             rpc_request(
                 method,
                 Some(PrefetchParams {
@@ -389,6 +399,35 @@ async fn request_prefetch(path: &Path) -> anyhow::Result<PrefetchResult> {
         .result
         .context("prefetch response was missing `result`")?;
     Ok(serde_json::from_value(result)?)
+}
+
+async fn request_complete(
+    file: &Path,
+    offset: usize,
+    prefix: Option<&str>,
+) -> anyhow::Result<Vec<crate::rpc::CompletionSuggestion>> {
+    let request = rpc_request(
+        "complete",
+        Some(CompleteParams {
+            file: canonicalize_rpc_path(file)?,
+            offset,
+            prefix: prefix.map(str::to_string),
+        }),
+    )?;
+    let response = send_rpc_request(&request).await?;
+    let response: crate::rpc::JsonRpcResponse = serde_json::from_str(&response)
+        .with_context(|| format!("invalid complete response: {response}"))?;
+    if let Some(error) = response.error {
+        anyhow::bail!("complete RPC failed: {} ({})", error.message, error.code);
+    }
+    let result = response
+        .result
+        .context("complete response was missing `result`")?;
+    let suggestions = result
+        .get("suggestions")
+        .cloned()
+        .context("complete response was missing `suggestions`")?;
+    Ok(serde_json::from_value(suggestions)?)
 }
 
 fn print_setup_summary(status: &StatusResult, prefetch: Option<(&Path, &PrefetchResult)>) {
@@ -552,4 +591,86 @@ where
 
 fn canonicalize_rpc_path(path: &Path) -> anyhow::Result<String> {
     Ok(path.canonicalize()?.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_bridge_request;
+    use crate::rpc::{CompleteParams, PrefetchParams};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_file_path(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "harnessd_commands_test_{}_{}",
+            std::process::id(),
+            TEST_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&base).expect("failed to create temp dir");
+        let path = base.join(name);
+        std::fs::write(&path, "fn demo() {}\n").expect("failed to write temp file");
+        path
+    }
+
+    #[test]
+    fn bridge_builds_complete_request() {
+        let file = temp_file_path("fixture.rs");
+        let request = build_bridge_request("complete", Some(&file), None, None, Some("7"))
+            .expect("failed to build complete request");
+
+        assert_eq!(request.method, "complete");
+        let params: CompleteParams =
+            serde_json::from_value(request.params.expect("missing params")).expect("bad params");
+        assert_eq!(
+            params.file,
+            file.canonicalize()
+                .expect("canonicalize failed")
+                .to_string_lossy()
+                .to_string()
+        );
+        assert_eq!(params.offset, 7);
+        assert_eq!(params.prefix, None);
+
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();
+    }
+
+    #[test]
+    fn bridge_builds_prefetch_request() {
+        let file = temp_file_path("fixture.rs");
+        let request = build_bridge_request("prefetch", Some(&file), None, None, None)
+            .expect("failed to build prefetch request");
+
+        assert_eq!(request.method, "prefetch");
+        let params: PrefetchParams =
+            serde_json::from_value(request.params.expect("missing params")).expect("bad params");
+        assert_eq!(
+            params.path,
+            file.canonicalize()
+                .expect("canonicalize failed")
+                .to_string_lossy()
+                .to_string()
+        );
+
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();
+    }
+
+    #[test]
+    fn bridge_complete_requires_cursor() {
+        let file = temp_file_path("fixture.rs");
+        let error = build_bridge_request("complete", Some(&file), None, None, None)
+            .expect_err("expected missing cursor to fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("`--cursor` is required for `bridge --method complete`")
+        );
+
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();
+    }
 }

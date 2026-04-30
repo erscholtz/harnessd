@@ -39,7 +39,7 @@ Use this when changing code or planning work. Detailed roadmap lives in **`priv/
 3. Proposal store (SQLite or similar).  
 4. **`complete`** with cache hit/miss and stubs.  
 5. Background TODO/anchor scanner + job queue (placeholder generator before real LLM).  
-6. **`zed-bridge`** for `complete`.  
+6. **`bridge`** for `complete`.  
 7. Prefetch + priority; metrics/logging for latency and cache hits.  
 8. Later: `research`, `inline`, `index`, vector/crawl, Kimi pool — per plan.
 

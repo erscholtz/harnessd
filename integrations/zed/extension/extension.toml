@@ -1,0 +1,11 @@
+id = "harnessd"
+name = "harnessd"
+description = "Local harnessd completions for Rust files"
+version = "0.0.1"
+schema_version = 1
+authors = ["harnessd"]
+repository = "https://github.com/local/harnessd"
+
+[language_servers.harnessd]
+name = "harnessd"
+languages = ["Rust"]

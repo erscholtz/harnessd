@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "harnessd",
     version,
-    about = "Local research harness (daemon + CLI + Zed bridge)"
+    about = "Local research harness (daemon + CLI + editor bridge)"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -40,6 +40,9 @@ pub enum Commands {
     /// Open a live terminal dashboard for daemon and cache status.
     Tui,
 
+    /// Run the editor-facing Language Server Protocol adapter over stdio.
+    Lsp,
+
     /// Debug the autocomplete path by asking the daemon for completions.
     Complete {
         /// Absolute or workspace-relative file path.
@@ -69,8 +72,8 @@ pub enum Commands {
         manual: Option<PathBuf>,
     },
 
-    /// One-shot RPC bridge for Zed tasks (stdout is the JSON-RPC response).
-    ZedBridge {
+    /// One-shot RPC bridge for editor integrations (stdout is the JSON-RPC response).
+    Bridge {
         /// JSON-RPC method name (e.g. inline, complete)
         #[arg(long)]
         method: String,

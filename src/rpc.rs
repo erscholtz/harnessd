@@ -84,7 +84,7 @@ pub struct CompleteParams {
 }
 
 /// A completion suggestion.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CompletionSuggestion {
     /// Label shown in the UI.
     pub label: String,

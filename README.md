@@ -1,6 +1,6 @@
 # harnessd
 
-`harnessd` is a Rust daemon + CLI that provides a **local “research harness”** via a small JSON-RPC API. A long-lived daemon owns all state, and multiple front-ends can talk to it (starting with a CLI client and a Zed stdio bridge).
+`harnessd` is a Rust daemon + CLI that provides a **local “research harness”** via a small JSON-RPC API. A long-lived daemon owns all state, and multiple front-ends can talk to it (starting with a CLI client and an editor stdio bridge).
 
 ## Goal (v0.0.1)
 
@@ -9,7 +9,7 @@ Prove the end-to-end architecture:
 - **Daemon**: `harnessd --daemon`
 - **Protocol**: JSON-RPC 2.0 over a local socket
 - **CLI client**: `harnessd research "<query>"`
-- **Zed bridge**: `harnessd zed-bridge ...` (one-shot request → stdout response)
+- **Editor bridge**: `harnessd bridge ...` (one-shot request → stdout response)
 
 For v0.0.1, `research` is a **stub** (no network): it should accept a query (and optionally sources) and return a structured JSON result.
 
@@ -19,7 +19,7 @@ For v0.0.1, `research` is a **stub** (no network): it should accept a query (and
 - **Local RPC**: clients connect to a local socket and send JSON-RPC requests.
 - **Two front-ends**:
   - **CLI**: runs commands like `research`; starts the daemon if needed.
-  - **Zed stdio bridge**: Zed tasks can pipe a request to `harnessd`, which forwards it to the daemon and prints the response.
+  - **Editor stdio bridge**: editor tasks can pipe a request to `harnessd`, which forwards it to the daemon and prints the response.
 
 Planned daemon “context” (not all in v0.0.1):
 
@@ -109,6 +109,23 @@ and waits for the lock and IPC endpoint to disappear cleanly. `doctor` reports
 stale lock/port files and other common runtime mismatches in a user-facing
 format.
 
+## Editor integrations
+
+Editor-specific adapters live under `integrations/`.
+
+- `integrations/nvim/`: Neovim Lua wrapper around `harnessd complete` and `harnessd prefetch`
+- `integrations/zed/`: Zed wrapper scripts and a local dev extension for Rust autocomplete
+
+To test Zed autocomplete locally:
+
+```powershell
+cargo build
+```
+
+Then install `integrations/zed/extension/` with `zed: install dev extension`.
+The extension launches `harnessd lsp`, which prefetches Rust files on open/save
+and returns cached harnessd proposals through Zed's normal completion popup.
+
 ### Test
 
 ```bash
@@ -118,6 +135,7 @@ cargo test
 ## Project layout
 
 - `src/main.rs`: binary entrypoint
+- `integrations/`: editor and IDE integration assets
 - `Cargo.toml`: crate metadata + dependencies
 - `Cargo.lock`: resolved dependency graph (checked in)
 - `.gitignore`: ignores `target/`, build noise (`*.pdb`), IDE/OS cruft, env files, and `priv/local/` for machine-specific notes; `priv/plan.txt` and `priv/TODO.md` are meant to be committable
@@ -134,7 +152,7 @@ cargo test
 - dependencies are in place; next is wiring the daemon/client/bridge around them
 - implement daemon: runtime dir + single-instance lock + socket listener + JSON-RPC parsing/dispatch
 - implement CLI client: connect/send/print; spawn daemon if missing
-- implement `zed-bridge`: forward one RPC and print JSON for Zed tasks
+- implement `bridge`: forward one RPC and print JSON for editor tasks
 
 ## Next edits (README)
 

@@ -1,4 +1,4 @@
-//! Local research harness: CLI, long-lived daemon, and Zed bridge (`harnessd --help`).
+//! Local research harness: CLI, long-lived daemon, and editor bridge (`harnessd --help`).
 #![warn(missing_docs)]
 
 use anyhow::Context;

@@ -12,7 +12,7 @@ name = "harnessd"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "io-util", "process", "signal", "time", "fs", "net"] }
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "io-util", "io-std", "process", "signal", "time", "fs", "net"] }
 interprocess = { version = "2.4.0", features = ["tokio"] }
 tokio-util = { version = "0.7.18", features = ["codec"] }
 tokio-serde = { version = "0.9.0", features = ["json"] }
