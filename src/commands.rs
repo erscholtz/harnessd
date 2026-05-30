@@ -1,15 +1,20 @@
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-use crate::cli::Commands;
+use crate::cli::{Commands, ThreadCommands};
 use crate::daemon_lock::{DaemonLock, read_daemon_pid};
 use crate::paths;
-use crate::rpc::{CompleteParams, JsonRpcRequest, PrefetchParams, PrefetchResult, StatusResult};
+use crate::rpc::{
+    AnchorsParams, CodexSessionsParams, CompleteParams, GenerateParams, InlineParams,
+    JsonRpcRequest, PrefetchParams, PrefetchResult, StatusResult, ThreadAttachParams,
+    ThreadCreateParams, ThreadLinkParams, ThreadListParams, ThreadResolveParams,
+};
 use crate::runtime;
 
 /// Run the selected CLI subcommand.
@@ -27,7 +32,18 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
             offset,
             prefix,
         } => run_complete(&file, offset, prefix.as_deref()).await,
+        Commands::Inline {
+            file,
+            offset,
+            prompt,
+        } => run_inline(&file, offset, &prompt).await,
         Commands::Prefetch { path } => run_prefetch(&path).await,
+        Commands::CodexSessions {
+            workspace,
+            all,
+            limit,
+        } => run_codex_sessions(&workspace, all, limit).await,
+        Commands::Thread { command } => run_thread(command).await,
         Commands::Research { query, manual } => run_research(&query, manual.as_deref()).await,
         Commands::Bridge {
             method,
@@ -252,6 +268,51 @@ async fn run_complete(file: &Path, offset: usize, prefix: Option<&str>) -> anyho
     Ok(())
 }
 
+async fn run_inline(file: &Path, offset: usize, prompt: &str) -> anyhow::Result<()> {
+    let content = read_stdin_optional().await?;
+    if content.is_empty() {
+        anyhow::bail!("`inline` requires live buffer contents on stdin");
+    }
+    let request = build_inline_request(file, offset, prompt, content)?;
+    println!("{}", send_rpc_request(&request).await?);
+    Ok(())
+}
+
+async fn read_stdin_optional() -> anyhow::Result<String> {
+    if std::io::stdin().is_terminal() {
+        return Ok(String::new());
+    }
+    let mut content = String::new();
+    tokio::io::stdin()
+        .read_to_string(&mut content)
+        .await
+        .context("failed to read stdin")?;
+    Ok(content)
+}
+
+fn build_inline_request(
+    file: &Path,
+    offset: usize,
+    prompt: &str,
+    content: String,
+) -> anyhow::Result<JsonRpcRequest> {
+    if prompt.trim().is_empty() {
+        anyhow::bail!("`--prompt` must not be empty for `inline`");
+    }
+    if content.is_empty() {
+        anyhow::bail!("`inline` requires live buffer contents on stdin");
+    }
+    rpc_request(
+        "inline",
+        Some(InlineParams {
+            file: canonicalize_rpc_path(file)?,
+            offset,
+            content,
+            prompt: prompt.to_string(),
+        }),
+    )
+}
+
 async fn run_prefetch(path: &Path) -> anyhow::Result<()> {
     let request = rpc_request(
         "prefetch",
@@ -260,6 +321,115 @@ async fn run_prefetch(path: &Path) -> anyhow::Result<()> {
         }),
     )?;
     println!("{}", send_rpc_request(&request).await?);
+    Ok(())
+}
+
+async fn run_codex_sessions(workspace: &Path, all: bool, limit: usize) -> anyhow::Result<()> {
+    let request = rpc_request(
+        "codex.sessions",
+        Some(CodexSessionsParams {
+            workspace: canonicalize_rpc_path(workspace)?,
+            all,
+            limit: Some(limit),
+        }),
+    )?;
+    println!("{}", send_rpc_request(&request).await?);
+    Ok(())
+}
+
+async fn run_thread(command: ThreadCommands) -> anyhow::Result<()> {
+    match command {
+        ThreadCommands::Create {
+            workspace,
+            file,
+            offset,
+            prompt,
+            selection_start,
+            selection_end,
+        } => {
+            let content = read_stdin_optional().await?;
+            if content.is_empty() {
+                anyhow::bail!("`thread create` requires live buffer contents on stdin");
+            }
+            let request = rpc_request(
+                "thread.create",
+                Some(ThreadCreateParams {
+                    workspace: canonicalize_rpc_path(&workspace)?,
+                    file: canonicalize_rpc_path(&file)?,
+                    offset,
+                    content,
+                    prompt,
+                    selection_start,
+                    selection_end,
+                }),
+            )?;
+            println!("{}", send_rpc_request(&request).await?);
+        }
+        ThreadCommands::List { workspace, file } => {
+            let content = read_stdin_optional().await?;
+            let request = rpc_request(
+                "thread.list",
+                Some(ThreadListParams {
+                    workspace: canonicalize_rpc_path(&workspace)?,
+                    file: file.as_deref().map(canonicalize_rpc_path).transpose()?,
+                    content: (!content.is_empty()).then_some(content),
+                }),
+            )?;
+            println!("{}", send_rpc_request(&request).await?);
+        }
+        ThreadCommands::Link {
+            thread_id,
+            session_id,
+            session_path,
+        } => {
+            let request = rpc_request(
+                "thread.link",
+                Some(ThreadLinkParams {
+                    thread_id,
+                    codex_session_id: session_id,
+                    codex_session_path: session_path.map(|path| path.display().to_string()),
+                }),
+            )?;
+            println!("{}", send_rpc_request(&request).await?);
+        }
+        ThreadCommands::Resolve {
+            thread_id,
+            workspace,
+            started_after,
+        } => {
+            let request = rpc_request(
+                "thread.resolve",
+                Some(ThreadResolveParams {
+                    thread_id,
+                    workspace: canonicalize_rpc_path(&workspace)?,
+                    started_after_unix: started_after,
+                }),
+            )?;
+            println!("{}", send_rpc_request(&request).await?);
+        }
+        ThreadCommands::Attach {
+            workspace,
+            file,
+            offset,
+            session_id,
+        } => {
+            let content = read_stdin_optional().await?;
+            if content.is_empty() {
+                anyhow::bail!("`thread attach` requires live buffer contents on stdin");
+            }
+            let request = rpc_request(
+                "thread.attach",
+                Some(ThreadAttachParams {
+                    workspace: canonicalize_rpc_path(&workspace)?,
+                    file: canonicalize_rpc_path(&file)?,
+                    offset,
+                    content,
+                    codex_session_id: session_id,
+                }),
+            )?;
+            println!("{}", send_rpc_request(&request).await?);
+        }
+    }
     Ok(())
 }
 
@@ -305,6 +475,29 @@ fn build_bridge_request(
                 method,
                 Some(PrefetchParams {
                     path: canonicalize_rpc_path(file_or_dir)?,
+                }),
+            )
+        }
+        "anchors" => {
+            let file = file.context("`--file` is required for `bridge --method anchors`")?;
+            rpc_request(
+                method,
+                Some(AnchorsParams {
+                    file: canonicalize_rpc_path(file)?,
+                }),
+            )
+        }
+        "generate" => {
+            let file = file.context("`--file` is required for `bridge --method generate`")?;
+            let offset = cursor
+                .context("`--cursor` is required for `bridge --method generate`")?
+                .parse::<usize>()
+                .context("`--cursor` must be a byte offset for `generate`")?;
+            rpc_request(
+                method,
+                Some(GenerateParams {
+                    file: canonicalize_rpc_path(file)?,
+                    offset,
                 }),
             )
         }
@@ -595,8 +788,8 @@ fn canonicalize_rpc_path(path: &Path) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_bridge_request;
-    use crate::rpc::{CompleteParams, PrefetchParams};
+    use super::{build_bridge_request, build_inline_request};
+    use crate::rpc::{CompleteParams, GenerateParams, InlineParams, PrefetchParams};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -659,6 +852,21 @@ mod tests {
     }
 
     #[test]
+    fn bridge_builds_generate_request() {
+        let file = temp_file_path("fixture.rs");
+        let request = build_bridge_request("generate", Some(&file), None, None, Some("7"))
+            .expect("failed to build generate request");
+
+        assert_eq!(request.method, "generate");
+        let params: GenerateParams =
+            serde_json::from_value(request.params.expect("missing params")).expect("bad params");
+        assert_eq!(params.offset, 7);
+
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();
+    }
+
+    #[test]
     fn bridge_complete_requires_cursor() {
         let file = temp_file_path("fixture.rs");
         let error = build_bridge_request("complete", Some(&file), None, None, None)
@@ -669,6 +877,32 @@ mod tests {
                 .to_string()
                 .contains("`--cursor` is required for `bridge --method complete`")
         );
+
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();
+    }
+
+    #[test]
+    fn inline_builds_request_from_live_buffer_content() {
+        let file = temp_file_path("fixture.rs");
+        let request = build_inline_request(&file, 7, "insert a value", "fn unsaved() {}".into())
+            .expect("failed to build inline request");
+        assert_eq!(request.method, "inline");
+        let params: InlineParams =
+            serde_json::from_value(request.params.expect("missing params")).expect("bad params");
+        assert_eq!(params.offset, 7);
+        assert_eq!(params.prompt, "insert a value");
+        assert_eq!(params.content, "fn unsaved() {}");
+
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();
+    }
+
+    #[test]
+    fn inline_rejects_empty_content_and_prompt() {
+        let file = temp_file_path("fixture.rs");
+        assert!(build_inline_request(&file, 0, "ask", String::new()).is_err());
+        assert!(build_inline_request(&file, 0, " ", "fn x() {}".into()).is_err());
 
         std::fs::remove_file(&file).ok();
         std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();

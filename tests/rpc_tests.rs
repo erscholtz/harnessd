@@ -1,8 +1,9 @@
 //! Integration tests for the RPC module.
 
 use harnessd::rpc::{
-    CacheStatus, CompleteParams, DaemonMetricsSnapshot, JsonRpcRequest, JsonRpcResponse,
-    PrefetchParams, RecentProposal, StatusResult,
+    AnchorsParams, CacheStatus, CodexSessionsParams, CompleteParams, DaemonMetricsSnapshot,
+    GenerateParams, InlineParams, JsonRpcRequest, JsonRpcResponse, PrefetchParams, RecentProposal,
+    StatusResult, ThreadCreateParams, ThreadListParams,
 };
 
 #[test]
@@ -86,6 +87,71 @@ fn test_prefetch_params_deserialization() {
 
     let params: PrefetchParams = serde_json::from_str(json).expect("failed to deserialize");
     assert_eq!(params.path, "/workspace/project");
+}
+
+#[test]
+fn test_anchor_and_generate_params_deserialization() {
+    let anchors: AnchorsParams =
+        serde_json::from_str(r#"{"file":"/test/file.rs"}"#).expect("bad anchors params");
+    let generate: GenerateParams = serde_json::from_str(r#"{"file":"/test/file.rs","offset":42}"#)
+        .expect("bad generate params");
+    assert_eq!(anchors.file, "/test/file.rs");
+    assert_eq!(generate.offset, 42);
+}
+
+#[test]
+fn test_inline_params_roundtrip() {
+    let params = InlineParams {
+        file: "/test/file.rs".to_string(),
+        offset: 12,
+        content: "fn unsaved() {}".to_string(),
+        prompt: "insert validation".to_string(),
+    };
+    let json = serde_json::to_string(&params).expect("failed to serialize inline params");
+    let decoded: InlineParams =
+        serde_json::from_str(&json).expect("failed to deserialize inline params");
+    assert_eq!(decoded.file, params.file);
+    assert_eq!(decoded.offset, params.offset);
+    assert_eq!(decoded.content, params.content);
+    assert_eq!(decoded.prompt, params.prompt);
+}
+
+#[test]
+fn test_codex_sessions_params_roundtrip() {
+    let params = CodexSessionsParams {
+        workspace: "/workspace".to_string(),
+        all: true,
+        limit: Some(25),
+    };
+    let json = serde_json::to_string(&params).expect("failed to serialize codex params");
+    let decoded: CodexSessionsParams =
+        serde_json::from_str(&json).expect("failed to deserialize codex params");
+    assert_eq!(decoded.workspace, params.workspace);
+    assert!(decoded.all);
+    assert_eq!(decoded.limit, Some(25));
+}
+
+#[test]
+fn test_thread_params_roundtrip() {
+    let create = ThreadCreateParams {
+        workspace: "/workspace".to_string(),
+        file: "/workspace/src/main.rs".to_string(),
+        offset: 12,
+        content: "fn main() {}".to_string(),
+        prompt: "ask".to_string(),
+        selection_start: Some(1),
+        selection_end: Some(5),
+    };
+    let json = serde_json::to_string(&create).expect("failed to serialize thread create");
+    let decoded: ThreadCreateParams =
+        serde_json::from_str(&json).expect("failed to deserialize thread create");
+    assert_eq!(decoded.offset, 12);
+    assert_eq!(decoded.selection_start, Some(1));
+
+    let list: ThreadListParams =
+        serde_json::from_str(r#"{"workspace":"/workspace","file":"/workspace/src/main.rs"}"#)
+            .expect("failed to deserialize thread list");
+    assert_eq!(list.content, None);
 }
 
 #[test]

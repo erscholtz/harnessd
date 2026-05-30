@@ -1,5 +1,5 @@
 use clap::Parser;
-use harnessd::cli::{Cli, Commands};
+use harnessd::cli::{Cli, Commands, ThreadCommands};
 
 #[test]
 fn parses_setup_with_prefetch_path() {
@@ -85,5 +85,101 @@ fn parses_bridge_complete_flags() {
             assert_eq!(cursor.as_deref(), Some("12"));
         }
         _ => panic!("expected bridge command"),
+    }
+}
+
+#[test]
+fn parses_inline_flags() {
+    let cli = Cli::parse_from([
+        "harnessd",
+        "inline",
+        "--file",
+        "src/main.rs",
+        "--offset",
+        "12",
+        "--prompt",
+        "insert validation",
+    ]);
+
+    match cli.command {
+        Commands::Inline {
+            file,
+            offset,
+            prompt,
+        } => {
+            assert_eq!(file, std::path::PathBuf::from("src/main.rs"));
+            assert_eq!(offset, 12);
+            assert_eq!(prompt, "insert validation");
+        }
+        _ => panic!("expected inline command"),
+    }
+}
+
+#[test]
+fn parses_codex_sessions_flags() {
+    let cli = Cli::parse_from([
+        "harnessd",
+        "codex-sessions",
+        "--workspace",
+        ".",
+        "--all",
+        "--limit",
+        "25",
+    ]);
+
+    match cli.command {
+        Commands::CodexSessions {
+            workspace,
+            all,
+            limit,
+        } => {
+            assert_eq!(workspace, std::path::PathBuf::from("."));
+            assert!(all);
+            assert_eq!(limit, 25);
+        }
+        _ => panic!("expected codex-sessions command"),
+    }
+}
+
+#[test]
+fn parses_thread_create_flags() {
+    let cli = Cli::parse_from([
+        "harnessd",
+        "thread",
+        "create",
+        "--workspace",
+        ".",
+        "--file",
+        "src/main.rs",
+        "--offset",
+        "12",
+        "--prompt",
+        "explain this",
+        "--selection-start",
+        "1",
+        "--selection-end",
+        "5",
+    ]);
+
+    match cli.command {
+        Commands::Thread {
+            command:
+                ThreadCommands::Create {
+                    workspace,
+                    file,
+                    offset,
+                    prompt,
+                    selection_start,
+                    selection_end,
+                },
+        } => {
+            assert_eq!(workspace, std::path::PathBuf::from("."));
+            assert_eq!(file, std::path::PathBuf::from("src/main.rs"));
+            assert_eq!(offset, 12);
+            assert_eq!(prompt, "explain this");
+            assert_eq!(selection_start, Some(1));
+            assert_eq!(selection_end, Some(5));
+        }
+        _ => panic!("expected thread create command"),
     }
 }

@@ -8,12 +8,18 @@ use anyhow::Context;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-use crate::parser::{AnchorKind, LanguageParsers, SupportedLanguage};
+use crate::acp::{GenerationContext, InlineContext};
+use crate::parser::{Anchor, AnchorKind, LanguageParsers, ParsedFile, SupportedLanguage};
 use crate::rpc::{
-    CompleteParams, CompletionSuggestion, JsonRpcRequest, JsonRpcResponse, PrefetchParams,
-    PrefetchResult, StatusResult,
+    AnchorInfo, AnchorsParams, CodexSessionsParams, CompleteParams, CompletionSuggestion,
+    GenerateParams, InlineParams, JsonRpcRequest, JsonRpcResponse, PrefetchParams, PrefetchResult,
+    StatusResult, ThreadAttachParams, ThreadCreateParams, ThreadLinkParams, ThreadListParams,
+    ThreadResolveParams,
 };
 use crate::state::DaemonState;
+
+const INLINE_CONTEXT_MAX_BYTES: usize = 16_384;
+const CURSOR_MARKER: &str = "<HARNESSD_CURSOR>";
 
 /// Start the IPC server and listen for JSON-RPC connections.
 pub async fn serve(
@@ -163,6 +169,15 @@ async fn process_request(
 
     match request.method.as_str() {
         "complete" => handle_complete(request, state).await,
+        "anchors" => handle_anchors(request, state).await,
+        "generate" => handle_generate(request, state).await,
+        "inline" => handle_inline(request, state).await,
+        "codex.sessions" => handle_codex_sessions(request).await,
+        "thread.create" => handle_thread_create(request, state).await,
+        "thread.list" => handle_thread_list(request, state).await,
+        "thread.link" => handle_thread_link(request, state).await,
+        "thread.resolve" => handle_thread_resolve(request, state).await,
+        "thread.attach" => handle_thread_attach(request, state).await,
         "prefetch" => handle_prefetch(request, state).await,
         "status" => handle_status(request, state).await,
         "shutdown" => handle_shutdown(request, shutdown_tx).await,
@@ -174,6 +189,212 @@ async fn process_request(
         ),
     }
     .to_string()
+}
+
+async fn handle_codex_sessions(request: JsonRpcRequest) -> JsonRpcResponse {
+    let params: CodexSessionsParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    match codex_sessions(&params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => JsonRpcResponse::error(
+            request.id,
+            -32000,
+            format!("Codex session listing failed: {e}"),
+            None,
+        ),
+    }
+}
+
+async fn handle_thread_create(
+    request: JsonRpcRequest,
+    state: &Arc<DaemonState>,
+) -> JsonRpcResponse {
+    let params: ThreadCreateParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    match thread_create(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => JsonRpcResponse::error(
+            request.id,
+            -32000,
+            format!("Thread create failed: {e}"),
+            None,
+        ),
+    }
+}
+
+async fn handle_thread_list(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcResponse {
+    let params: ThreadListParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    match thread_list(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => {
+            JsonRpcResponse::error(request.id, -32000, format!("Thread list failed: {e}"), None)
+        }
+    }
+}
+
+async fn handle_thread_link(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcResponse {
+    let params: ThreadLinkParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    match thread_link(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => {
+            JsonRpcResponse::error(request.id, -32000, format!("Thread link failed: {e}"), None)
+        }
+    }
+}
+
+async fn handle_thread_resolve(
+    request: JsonRpcRequest,
+    state: &Arc<DaemonState>,
+) -> JsonRpcResponse {
+    let params: ThreadResolveParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    match thread_resolve(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => JsonRpcResponse::error(
+            request.id,
+            -32000,
+            format!("Thread resolve failed: {e}"),
+            None,
+        ),
+    }
+}
+
+async fn handle_thread_attach(
+    request: JsonRpcRequest,
+    state: &Arc<DaemonState>,
+) -> JsonRpcResponse {
+    let params: ThreadAttachParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return response,
+    };
+    match thread_attach(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => JsonRpcResponse::error(
+            request.id,
+            -32000,
+            format!("Thread attach failed: {e}"),
+            None,
+        ),
+    }
+}
+
+fn required_params<T>(request: &JsonRpcRequest) -> Result<T, JsonRpcResponse>
+where
+    T: serde::de::DeserializeOwned,
+{
+    match request.params.clone() {
+        Some(p) => serde_json::from_value(p).map_err(|e| {
+            JsonRpcResponse::error(
+                request.id.clone(),
+                -32602,
+                format!("Invalid params: {e}"),
+                None,
+            )
+        }),
+        None => Err(JsonRpcResponse::error(
+            request.id.clone(),
+            -32602,
+            "Missing params".to_string(),
+            None,
+        )),
+    }
+}
+
+async fn handle_anchors(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcResponse {
+    let params: AnchorsParams = match request.params {
+        Some(p) => match serde_json::from_value(p) {
+            Ok(params) => params,
+            Err(e) => {
+                return JsonRpcResponse::error(
+                    request.id,
+                    -32602,
+                    format!("Invalid params: {e}"),
+                    None,
+                );
+            }
+        },
+        None => {
+            return JsonRpcResponse::error(request.id, -32602, "Missing params".to_string(), None);
+        }
+    };
+    match anchors(state, &params).await {
+        Ok(anchors) => {
+            JsonRpcResponse::success(request.id, serde_json::json!({ "anchors": anchors }))
+        }
+        Err(e) => JsonRpcResponse::error(request.id, -32000, format!("Anchors failed: {e}"), None),
+    }
+}
+
+async fn handle_generate(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcResponse {
+    let params: GenerateParams = match request.params {
+        Some(p) => match serde_json::from_value(p) {
+            Ok(params) => params,
+            Err(e) => {
+                return JsonRpcResponse::error(
+                    request.id,
+                    -32602,
+                    format!("Invalid params: {e}"),
+                    None,
+                );
+            }
+        },
+        None => {
+            return JsonRpcResponse::error(request.id, -32602, "Missing params".to_string(), None);
+        }
+    };
+    match generate(state, &params).await {
+        Ok(suggestion) => {
+            JsonRpcResponse::success(request.id, serde_json::json!({ "suggestion": suggestion }))
+        }
+        Err(e) => JsonRpcResponse::error(
+            request.id,
+            -32001,
+            format!("Generation failed: {e}"),
+            Some(serde_json::json!({ "retryable": true })),
+        ),
+    }
+}
+
+async fn handle_inline(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcResponse {
+    let params: InlineParams = match request.params {
+        Some(p) => match serde_json::from_value(p) {
+            Ok(params) => params,
+            Err(e) => {
+                return JsonRpcResponse::error(
+                    request.id,
+                    -32602,
+                    format!("Invalid params: {e}"),
+                    None,
+                );
+            }
+        },
+        None => {
+            return JsonRpcResponse::error(request.id, -32602, "Missing params".to_string(), None);
+        }
+    };
+    match inline(state, &params).await {
+        Ok(suggestion) => {
+            JsonRpcResponse::success(request.id, serde_json::json!({ "suggestion": suggestion }))
+        }
+        Err(e) => JsonRpcResponse::error(
+            request.id,
+            -32001,
+            format!("Inline generation failed: {e}"),
+            Some(serde_json::json!({ "retryable": true })),
+        ),
+    }
 }
 
 async fn handle_complete(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcResponse {
@@ -278,7 +499,26 @@ pub async fn complete(
         return Ok(suggestions);
     }
 
-    if let Some(function) = parsed.enclosing_function(params.offset) {
+    if suggestions.is_empty() {
+        for region in regions_for_anchors(&parsed, &params.file)
+            .into_iter()
+            .filter(|region| {
+                params.offset >= region.context_start && params.offset <= region.context_end
+            })
+        {
+            let proposals = state
+                .cache
+                .lookup(&params.file, region.start, region.end, &region.content_hash)
+                .await
+                .unwrap_or_default();
+            suggestions.extend(proposals_to_suggestions(proposals, "cached (anchor)"));
+        }
+    }
+
+    // Preserve entries created by older function-scoped cache behavior as a fallback only.
+    if suggestions.is_empty()
+        && let Some(function) = parsed.enclosing_function(params.offset)
+    {
         let function_text = parsed.node_text(function);
         let function_hash = crate::cache::compute_hash(function_text);
         let function_proposals = state
@@ -296,6 +536,187 @@ pub async fn complete(
 
     apply_prefix_filter(&mut suggestions, params.prefix.as_deref());
     Ok(suggestions)
+}
+
+/// Inspect the anchors in one saved file without triggering generation.
+pub async fn anchors(
+    state: &Arc<DaemonState>,
+    params: &AnchorsParams,
+) -> anyhow::Result<Vec<AnchorInfo>> {
+    let content = tokio::fs::read_to_string(&params.file)
+        .await
+        .with_context(|| format!("failed to read {}", params.file))?;
+    let mut parser = state.parser.write().await;
+    let parsed = parser.parse_file(Path::new(&params.file), &content)?;
+    drop(parser);
+
+    let regions = regions_for_anchors(&parsed, &params.file);
+    let mut result = Vec::with_capacity(regions.len());
+    for region in regions {
+        let proposals = state
+            .cache
+            .lookup(&params.file, region.start, region.end, &region.content_hash)
+            .await?;
+        let status = if !proposals.is_empty() {
+            "ready"
+        } else if state.generation_failed(&region.key).await {
+            "failed"
+        } else {
+            "candidate"
+        };
+        result.push(AnchorInfo {
+            anchor_start: region.anchor.byte_range.start,
+            anchor_end: region.anchor.byte_range.end,
+            region_start: region.start,
+            region_end: region.end,
+            kind: kind_name(region.anchor.kind).to_string(),
+            label: label_for_anchor(region.anchor.kind).to_string(),
+            status: status.to_string(),
+        });
+    }
+    Ok(result)
+}
+
+/// Generate a bounded proposal for the anchor region at a saved-file cursor location.
+pub async fn generate(
+    state: &Arc<DaemonState>,
+    params: &GenerateParams,
+) -> anyhow::Result<CompletionSuggestion> {
+    let content = tokio::fs::read_to_string(&params.file)
+        .await
+        .with_context(|| format!("failed to read {}", params.file))?;
+    let mut parser = state.parser.write().await;
+    let parsed = parser.parse_file(Path::new(&params.file), &content)?;
+    drop(parser);
+
+    let region = regions_for_anchors(&parsed, &params.file)
+        .into_iter()
+        .find(|region| params.offset >= region.start && params.offset <= region.end)
+        .context("cursor is not within an anchor-bearing region")?;
+
+    if let Some(proposal) = state
+        .cache
+        .lookup(&params.file, region.start, region.end, &region.content_hash)
+        .await?
+        .into_iter()
+        .next()
+    {
+        return Ok(proposal_to_suggestion(proposal, "cached"));
+    }
+
+    let context = GenerationContext {
+        file: Path::new(&params.file),
+        language: language_name(parsed.language),
+        anchor_kind: kind_name(region.anchor.kind),
+        anchor_text: &region.anchor.context,
+        region_text: &region.text,
+    };
+    let snippet = match state.acp.generate(&context).await {
+        Ok(snippet) => snippet,
+        Err(error) => {
+            state.mark_generation_failed(region.key).await;
+            return Err(error);
+        }
+    };
+    state
+        .cache
+        .store(
+            &params.file,
+            region.start,
+            region.end,
+            &region.content_hash,
+            &snippet,
+            label_for_anchor(region.anchor.kind),
+        )
+        .await?;
+    state.clear_generation_failed(&region.key).await;
+    Ok(CompletionSuggestion {
+        label: label_for_anchor(region.anchor.kind).to_string(),
+        insert_text: snippet,
+        detail: Some("generated through ACP".to_string()),
+        documentation: None,
+    })
+}
+
+/// Generate an ephemeral bounded proposal at a live-buffer cursor location.
+pub async fn inline(
+    state: &Arc<DaemonState>,
+    params: &InlineParams,
+) -> anyhow::Result<CompletionSuggestion> {
+    if params.prompt.trim().is_empty() {
+        anyhow::bail!("inline prompt must not be empty");
+    }
+    if params.offset > params.content.len() {
+        anyhow::bail!("cursor offset is outside buffer content");
+    }
+    if !params.content.is_char_boundary(params.offset) {
+        anyhow::bail!("cursor offset is not a UTF-8 character boundary");
+    }
+
+    let mut parser = state.parser.write().await;
+    let parsed = parser.parse_file(Path::new(&params.file), &params.content)?;
+    drop(parser);
+    let cursor_context = inline_cursor_context(&parsed, params.offset);
+    let context = InlineContext {
+        file: Path::new(&params.file),
+        language: language_name(parsed.language),
+        prompt: params.prompt.trim(),
+        cursor_context: &cursor_context,
+    };
+    let snippet = state.acp.generate_inline(&context).await?;
+    Ok(CompletionSuggestion {
+        label: "Inline ask".to_string(),
+        insert_text: snippet,
+        detail: Some("generated through ACP inline ask".to_string()),
+        documentation: None,
+    })
+}
+
+/// List Codex sessions for a workspace.
+pub async fn codex_sessions(
+    params: &CodexSessionsParams,
+) -> anyhow::Result<crate::codex_sessions::CodexSessionsResult> {
+    crate::codex_sessions::list_sessions(params)
+}
+
+/// Create a persistent source-line thread anchor.
+pub async fn thread_create(
+    state: &Arc<DaemonState>,
+    params: &ThreadCreateParams,
+) -> anyhow::Result<crate::threads::ThreadCreateResult> {
+    state.threads.create(params)
+}
+
+/// List persistent source-line thread anchors.
+pub async fn thread_list(
+    state: &Arc<DaemonState>,
+    params: &ThreadListParams,
+) -> anyhow::Result<crate::threads::ThreadListResult> {
+    state.threads.list(params)
+}
+
+/// Link a thread to a Codex session.
+pub async fn thread_link(
+    state: &Arc<DaemonState>,
+    params: &ThreadLinkParams,
+) -> anyhow::Result<crate::threads::ThreadLinkResult> {
+    state.threads.link(params)
+}
+
+/// Resolve a newly launched thread to a saved Codex session.
+pub async fn thread_resolve(
+    state: &Arc<DaemonState>,
+    params: &ThreadResolveParams,
+) -> anyhow::Result<crate::threads::ThreadResolveResult> {
+    state.threads.resolve(params)
+}
+
+/// Attach an existing Codex session to the current line.
+pub async fn thread_attach(
+    state: &Arc<DaemonState>,
+    params: &ThreadAttachParams,
+) -> anyhow::Result<crate::threads::ThreadLinkResult> {
+    state.threads.attach(params)
 }
 
 /// Scan a file or workspace path, find anchors, and populate the proposal cache.
@@ -328,43 +749,25 @@ pub async fn prefetch(
             }
         };
 
-        let anchors = parsed.find_anchors();
-        anchors_found += anchors.len();
+        let regions = regions_for_anchors(&parsed, &file_str);
+        anchors_found += regions.len();
 
-        for anchor in anchors {
-            let (byte_start, byte_end, content_hash, label) =
-                if let Some(function) = parsed.enclosing_function(anchor.byte_range.start) {
-                    let function_text = parsed.node_text(function);
-                    (
-                        function.start_byte(),
-                        function.end_byte(),
-                        crate::cache::compute_hash(function_text),
-                        label_for_anchor(anchor.kind),
-                    )
-                } else {
-                    (
-                        anchor.byte_range.start,
-                        anchor.byte_range.end,
-                        crate::cache::compute_hash(&anchor.context),
-                        label_for_anchor(anchor.kind),
-                    )
-                };
-
+        for region in regions {
             let snippet = snippet_for_anchor(
                 parsed.language,
                 parsed.comment_prefix(),
-                anchor.kind,
-                &anchor.context,
+                region.anchor.kind,
+                &region.anchor.context,
             );
             match state
                 .cache
                 .store(
                     &file_str,
-                    byte_start,
-                    byte_end,
-                    &content_hash,
+                    region.start,
+                    region.end,
+                    &region.content_hash,
                     &snippet,
-                    label,
+                    label_for_anchor(region.anchor.kind),
                 )
                 .await
             {
@@ -396,13 +799,17 @@ fn proposals_to_suggestions(
 ) -> Vec<CompletionSuggestion> {
     proposals
         .into_iter()
-        .map(|p| CompletionSuggestion {
-            label: p.label,
-            insert_text: p.snippet,
-            detail: Some(detail.to_string()),
-            documentation: None,
-        })
+        .map(|p| proposal_to_suggestion(p, detail))
         .collect()
+}
+
+fn proposal_to_suggestion(proposal: crate::cache::Proposal, detail: &str) -> CompletionSuggestion {
+    CompletionSuggestion {
+        label: proposal.label,
+        insert_text: proposal.snippet,
+        detail: Some(detail.to_string()),
+        documentation: None,
+    }
 }
 
 fn apply_prefix_filter(suggestions: &mut Vec<CompletionSuggestion>, prefix: Option<&str>) {
@@ -448,6 +855,114 @@ fn label_for_anchor(kind: AnchorKind) -> &'static str {
         AnchorKind::UnimplementedMacro => "Replace unimplemented!()",
         AnchorKind::EmptyFunctionBody => "Fill empty function",
     }
+}
+
+fn kind_name(kind: AnchorKind) -> &'static str {
+    match kind {
+        AnchorKind::TodoComment => "todo_comment",
+        AnchorKind::FixmeComment => "fixme_comment",
+        AnchorKind::TodoMacro => "todo_macro",
+        AnchorKind::UnimplementedMacro => "unimplemented_macro",
+        AnchorKind::EmptyFunctionBody => "empty_function_body",
+    }
+}
+
+fn language_name(language: SupportedLanguage) -> &'static str {
+    match language {
+        SupportedLanguage::Rust => "Rust",
+        SupportedLanguage::JavaScript => "JavaScript",
+        SupportedLanguage::TypeScript => "TypeScript",
+        SupportedLanguage::Tsx => "TSX",
+        SupportedLanguage::Python => "Python",
+        SupportedLanguage::Go => "Go",
+    }
+}
+
+struct AnchorRegion {
+    anchor: Anchor,
+    start: usize,
+    end: usize,
+    context_start: usize,
+    context_end: usize,
+    content_hash: String,
+    text: String,
+    key: String,
+}
+
+fn regions_for_anchors(parsed: &ParsedFile, file: &str) -> Vec<AnchorRegion> {
+    parsed
+        .find_anchors()
+        .into_iter()
+        .map(|anchor| {
+            let (context_start, context_end, text) =
+                if let Some(function) = parsed.enclosing_function(anchor.byte_range.start) {
+                    (
+                        function.start_byte(),
+                        function.end_byte(),
+                        parsed.node_text(function).to_string(),
+                    )
+                } else {
+                    (
+                        anchor.byte_range.start,
+                        anchor.byte_range.end,
+                        anchor.context.clone(),
+                    )
+                };
+            let content_hash = crate::cache::compute_hash(&text);
+            let start = anchor.byte_range.start;
+            let end = anchor.byte_range.end;
+            let key = format!("{file}\0{start}\0{end}\0{content_hash}");
+            AnchorRegion {
+                anchor,
+                start,
+                end,
+                context_start,
+                context_end,
+                content_hash,
+                text,
+                key,
+            }
+        })
+        .collect()
+}
+
+fn inline_cursor_context(parsed: &ParsedFile, offset: usize) -> String {
+    if let Some(function) = parsed.enclosing_function(offset) {
+        let text = parsed.node_text(function);
+        if text.len() <= INLINE_CONTEXT_MAX_BYTES {
+            let relative_offset = offset.saturating_sub(function.start_byte());
+            return insert_cursor_marker(text, relative_offset);
+        }
+    }
+
+    let source = parsed.source.as_str();
+    let half = INLINE_CONTEXT_MAX_BYTES / 2;
+    let mut start = offset.saturating_sub(half);
+    let mut end = (start + INLINE_CONTEXT_MAX_BYTES).min(source.len());
+    start = previous_char_boundary(source, start);
+    end = previous_char_boundary(source, end);
+    if end < offset {
+        end = offset;
+    }
+    if end - start < INLINE_CONTEXT_MAX_BYTES && end == source.len() {
+        start = previous_char_boundary(source, end.saturating_sub(INLINE_CONTEXT_MAX_BYTES));
+    }
+    insert_cursor_marker(&source[start..end], offset - start)
+}
+
+fn insert_cursor_marker(text: &str, offset: usize) -> String {
+    let mut context = String::with_capacity(text.len() + CURSOR_MARKER.len());
+    context.push_str(&text[..offset]);
+    context.push_str(CURSOR_MARKER);
+    context.push_str(&text[offset..]);
+    context
+}
+
+fn previous_char_boundary(text: &str, mut offset: usize) -> usize {
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
 }
 
 fn snippet_for_anchor(

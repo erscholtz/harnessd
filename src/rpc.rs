@@ -2,6 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::codex_sessions::{CodexSessionInfo, CodexSessionsParams, CodexSessionsResult};
+pub use crate::threads::{
+    ThreadAnchor, ThreadAttachParams, ThreadCreateParams, ThreadCreateResult, ThreadLaunch,
+    ThreadLinkParams, ThreadLinkResult, ThreadListParams, ThreadListResult, ThreadResolveParams,
+    ThreadResolveResult,
+};
+
 /// A JSON-RPC 2.0 request.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JsonRpcRequest {
@@ -81,6 +88,54 @@ pub struct CompleteParams {
     /// Optional prefix to filter suggestions.
     #[serde(default)]
     pub prefix: Option<String>,
+}
+
+/// Parameters for the `anchors` method.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AnchorsParams {
+    /// Absolute path to one saved source file.
+    pub file: String,
+}
+
+/// Parameters for the `generate` method.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GenerateParams {
+    /// Absolute path to one saved source file.
+    pub file: String,
+    /// Cursor position as a byte offset within an anchor marker.
+    pub offset: usize,
+}
+
+/// Parameters for an ephemeral freeform inline generation request.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InlineParams {
+    /// Absolute source file path used for language and workspace selection.
+    pub file: String,
+    /// Cursor position as a byte offset into `content`.
+    pub offset: usize,
+    /// Current editor buffer contents, including unsaved edits.
+    pub content: String,
+    /// User instruction for text to insert at the cursor.
+    pub prompt: String,
+}
+
+/// An anchor reported for an editor buffer.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AnchorInfo {
+    /// First byte of the TODO or empty-function marker.
+    pub anchor_start: usize,
+    /// End byte of the TODO or empty-function marker.
+    pub anchor_end: usize,
+    /// First byte of the proposal cache region.
+    pub region_start: usize,
+    /// End byte of the proposal cache region.
+    pub region_end: usize,
+    /// Machine-readable anchor kind.
+    pub kind: String,
+    /// Label shown to an editor user.
+    pub label: String,
+    /// Current cache/generation state: `candidate`, `ready`, or `failed`.
+    pub status: String,
 }
 
 /// A completion suggestion.

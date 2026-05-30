@@ -1,6 +1,8 @@
 # harnessd
 
-`harnessd` is a Rust daemon + CLI that provides a **local “research harness”** via a small JSON-RPC API. A long-lived daemon owns all state, and multiple front-ends can talk to it (starting with a CLI client and an editor stdio bridge).
+`harnessd` is a Rust daemon + CLI for saved-file, anchor-driven inline
+completions. A long-lived daemon owns parse and proposal state; clients can
+inspect TODO/FIXME-style anchors cheaply and request ACP generation explicitly.
 
 ## Goal (v0.0.1)
 
@@ -28,26 +30,29 @@ Planned daemon “context” (not all in v0.0.1):
 - vector DB for indexed docs/chunks
 - (later) model client/connection pool, streaming responses
 
-## JSON-RPC (planned surface)
+## JSON-RPC Surface
 
-Requests are JSON-RPC 2.0. Planned methods:
+Requests are JSON-RPC 2.0. Implemented methods:
 
-- `research(query, sources[], depth)` → result (later: streaming handle)
-- `inline(context, query)` → markdown response
-- `complete(file, cursor_pos, prefix)` → suggestions
-- `index(path_or_url)` → start background indexing
-- `stream_next(handle)` → chunk / EOF (later)
-
-In v0.0.1, only `research` is required; other methods may return “method not found”.
+- `anchors({ file })` returns saved-file anchor ranges and `candidate`, `ready`,
+  or `failed` state without starting generation.
+- `generate({ file, offset })` returns one bounded insertion suggestion when
+  `offset` is within an anchor marker. An uncached request launches `codex-acp`
+  over stdio ACP.
+- `inline({ file, offset, content, prompt })` returns ephemeral bounded ACP
+  insertion text using the editor's live buffer; it is not written to cache.
+- `complete({ file, offset, prefix })` remains a cache-only lookup.
+- `prefetch({ path })` remains a debug/cache warming path.
 
 ## Platform notes
 
-v0.0.1 uses a **cross-platform local socket** transport:
+v0.0.1 uses a local IPC transport:
 
-- **Windows**: named pipes
+- **Windows**: TCP loopback with the selected port recorded in `daemon.port`
 - **Linux/macOS**: Unix domain sockets
 
-This keeps IPC local (no TCP ports) while allowing native Windows development.
+Windows named pipes remain a future transport option; Unix socket behavior is
+unchanged.
 
 ## Dependencies (current)
 
@@ -66,12 +71,21 @@ The crate currently depends on:
 
 ### Prerequisites
 
-- Rust toolchain (stable) via `rustup`
+- Nix with flakes enabled, or a stable Rust toolchain
+- `codex-acp` and authenticated `codex` on `PATH` for uncached generation
 
 ### Build
 
 ```bash
 cargo build
+```
+
+On NixOS:
+
+```bash
+nix develop
+cargo test
+nix build
 ```
 
 ### Run
@@ -113,7 +127,7 @@ format.
 
 Editor-specific adapters live under `integrations/`.
 
-- `integrations/nvim/`: Neovim Lua wrapper around `harnessd complete` and `harnessd prefetch`
+- `integrations/nvim/`: Neovim Lua UI for anchored Codex threads, `inline`, cached `complete`, and `prefetch`
 - `integrations/zed/`: Zed wrapper scripts and a local dev extension for Rust autocomplete
 
 To test Zed autocomplete locally:
@@ -125,6 +139,24 @@ cargo build
 Then install `integrations/zed/extension/` with `zed: install dev extension`.
 The extension launches `harnessd lsp`, which prefetches Rust files on open/save
 and returns cached harnessd proposals through Zed's normal completion popup.
+
+Neovim supports anchored Codex threads in a right sidebar. `:HarnessdAsk`
+prompts for a task, stores a line anchor in `~/.local/share/harnessd/threads.json`,
+shows an `H` marker on the source line, and launches a real
+`codex --no-alt-screen` terminal session in the sidebar. The sidebar lists
+project-first saved sessions from `~/.codex/sessions` and can reopen linked
+threads later.
+
+The older ghost-text insertion flow is still available as `:HarnessdInline`,
+which sends live buffer contents through:
+
+```bash
+printf '%s' "$BUFFER_CONTENT" | harnessd inline --file src/main.rs --offset 10 --prompt "insert validation"
+```
+
+Use `:HarnessdThreads` to toggle the Codex thread sidebar. Use
+`:HarnessdComplete` to preview a saved-file cache hit, then
+`:HarnessdAccept` or `:HarnessdDismiss` to resolve either preview.
 
 ### Test
 
@@ -142,23 +174,20 @@ cargo test
 
 ## What’s explicitly not in v0.0.1
 
-- tmux panes / research window layout
+- tmux panes / research window layout; the current Codex-session UI is the
+  Neovim sidebar
 - vector DB, crawl cache, embeddings
 - model client (e.g. Kimi), SSE pool, streaming (`stream_next`)
-- full `inline`, `complete`, `index` behavior
+- full `research` and `index` behavior
 
-## Next edits (from `priv/TODO.md`)
+## Current scope
 
-- dependencies are in place; next is wiring the daemon/client/bridge around them
-- implement daemon: runtime dir + single-instance lock + socket listener + JSON-RPC parsing/dispatch
-- implement CLI client: connect/send/print; spawn daemon if missing
-- implement `bridge`: forward one RPC and print JSON for editor tasks
-
-## Next edits (README)
-
-As you refine requirements, we can fold them into:
-
-- a crisp 1–2 sentence purpose statement
-- a short feature list
-- concrete usage examples
-- a simple roadmap (if you want one)
+- daemon lifecycle, IPC, tree-sitter parsing, proposal cache, and cached
+  `complete` are in place
+- `anchors` inspection and explicit bounded `generate` through ACP are daemon
+  APIs; Neovim also exposes ephemeral freeform `inline` asks with ghost-text
+  preview and guarded acceptance
+- Neovim can create persistent line-anchored Codex threads and reopen saved
+  Codex CLI sessions without owning Codex auth or model state
+- background cache warming, priority, and latency/cache-hit metrics remain
+  autocomplete follow-up work

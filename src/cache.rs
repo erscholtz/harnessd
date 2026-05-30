@@ -62,9 +62,18 @@ impl ProposalCache {
             [],
         )?;
 
-        // Index for fast lookup by file and byte range
+        // Older databases may contain repeated scans for the same stable region.
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_proposals_lookup 
+            "DELETE FROM proposals
+             WHERE id NOT IN (
+                SELECT MAX(id) FROM proposals
+                GROUP BY file_path, byte_start, byte_end, content_hash
+             )",
+            [],
+        )?;
+        conn.execute("DROP INDEX IF EXISTS idx_proposals_lookup", [])?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_proposals_lookup
              ON proposals(file_path, byte_start, byte_end, content_hash)",
             [],
         )?;
@@ -109,7 +118,7 @@ impl ProposalCache {
         conn.execute(
             "INSERT INTO proposals (file_path, byte_start, byte_end, content_hash, snippet, label)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT DO UPDATE SET
+             ON CONFLICT(file_path, byte_start, byte_end, content_hash) DO UPDATE SET
                 snippet = excluded.snippet,
                 label = excluded.label,
                 created_at = unixepoch()",
@@ -123,7 +132,14 @@ impl ProposalCache {
             ],
         )?;
 
-        Ok(conn.last_insert_rowid())
+        let id = conn.query_row(
+            "SELECT id FROM proposals
+             WHERE file_path = ?1 AND byte_start = ?2 AND byte_end = ?3 AND content_hash = ?4",
+            params![file_path, byte_start as i64, byte_end as i64, content_hash],
+            |row| row.get(0),
+        )?;
+
+        Ok(id)
     }
 
     /// Lookup proposals for a specific file region.

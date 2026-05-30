@@ -30,6 +30,11 @@ pub fn recent_projects_path() -> PathBuf {
     runtime_dir().join("recent-projects.json")
 }
 
+/// Persistent Neovim line-thread anchors.
+pub fn threads_path() -> PathBuf {
+    runtime_dir().join("threads.json")
+}
+
 #[cfg(windows)]
 fn runtime_root() -> PathBuf {
     dirs::data_local_dir()

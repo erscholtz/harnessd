@@ -2,9 +2,14 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
+use harnessd::acp::AcpClient;
 use harnessd::ipc;
-use harnessd::rpc::{CompleteParams, PrefetchParams};
+use harnessd::rpc::{
+    AnchorsParams, CompleteParams, GenerateParams, InlineParams, PrefetchParams,
+    ThreadCreateParams, ThreadLinkParams, ThreadListParams,
+};
 use harnessd::state::DaemonState;
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -17,6 +22,18 @@ fn temp_runtime_dir() -> PathBuf {
         TEST_COUNTER.fetch_add(1, Ordering::SeqCst)
     );
     temp_dir.join(unique_name)
+}
+
+#[cfg(unix)]
+fn fake_acp(runtime_dir: &std::path::Path, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = runtime_dir.join("fake-acp.sh");
+    std::fs::write(&path, body).expect("failed to write fake ACP executable");
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    path
 }
 
 #[tokio::test]
@@ -143,6 +160,394 @@ async fn status_reports_cache_and_request_metrics() {
     assert!(status.runtime.warnings.is_empty());
     assert!(!status.recent_proposals.is_empty());
     assert_eq!(status.recent_proposals[0].label, "Implement TODO");
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[tokio::test]
+async fn thread_rpc_helpers_create_list_and_link() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).expect("failed to create runtime dir");
+
+    let file_path = runtime_dir.join("fixture.rs");
+    let source = "fn demo() {\n    let value = 1;\n}\n";
+    std::fs::write(&file_path, source).expect("failed to write fixture");
+    let state = DaemonState::new(runtime_dir.clone()).expect("failed to create daemon state");
+
+    let created = ipc::thread_create(
+        &state,
+        &ThreadCreateParams {
+            workspace: runtime_dir.to_string_lossy().to_string(),
+            file: file_path.to_string_lossy().to_string(),
+            offset: source.find("value").unwrap(),
+            content: source.to_string(),
+            prompt: "explain value".to_string(),
+            selection_start: None,
+            selection_end: None,
+        },
+    )
+    .await
+    .expect("thread create failed");
+    assert_eq!(created.thread.current_line, 2);
+    assert_eq!(created.launch.argv[0], "codex");
+
+    let linked = ipc::thread_link(
+        &state,
+        &ThreadLinkParams {
+            thread_id: created.thread.thread_id.clone(),
+            codex_session_id: "session-1".to_string(),
+            codex_session_path: None,
+        },
+    )
+    .await
+    .expect("thread link failed");
+    assert_eq!(linked.thread.codex_session_id.as_deref(), Some("session-1"));
+
+    let shifted = "fn prelude() {}\nfn demo() {\n    let value = 1;\n}\n";
+    let listed = ipc::thread_list(
+        &state,
+        &ThreadListParams {
+            workspace: runtime_dir.to_string_lossy().to_string(),
+            file: Some(file_path.to_string_lossy().to_string()),
+            content: Some(shifted.to_string()),
+        },
+    )
+    .await
+    .expect("thread list failed");
+    assert_eq!(listed.threads.len(), 1);
+    assert_eq!(listed.threads[0].current_line, 3);
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[tokio::test]
+async fn anchors_report_supported_anchor_kinds_and_candidate_state() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).expect("failed to create runtime dir");
+    let file_path = runtime_dir.join("anchors.rs");
+    std::fs::write(
+        &file_path,
+        "fn a() { // TODO: one\n let x = 1; }\nfn b() { // FIXME: two\n let y = 1; }\nfn c() { todo!(); }\nfn d() { unimplemented!(); }\nfn empty() {}\n",
+    )
+    .unwrap();
+    let state = DaemonState::new(runtime_dir.clone()).unwrap();
+
+    let anchors = ipc::anchors(
+        &state,
+        &AnchorsParams {
+            file: file_path.to_string_lossy().to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let kinds: Vec<_> = anchors.iter().map(|anchor| anchor.kind.as_str()).collect();
+    assert!(kinds.contains(&"todo_comment"));
+    assert!(kinds.contains(&"fixme_comment"));
+    assert!(kinds.contains(&"todo_macro"));
+    assert!(kinds.contains(&"unimplemented_macro"));
+    assert!(kinds.contains(&"empty_function_body"));
+    assert!(anchors.iter().all(|anchor| anchor.status == "candidate"));
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn generate_via_acp_is_bounded_cached_and_deduplicated() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let agent = fake_acp(
+        &runtime_dir,
+        r##"#!/bin/sh
+read -r ignored
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}'
+read -r ignored
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"fake"}}'
+read -r ignored
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"```rust\nlet value = "}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"42;\n```"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
+"##,
+    );
+    let file_path = runtime_dir.join("fixture.rs");
+    let source = "fn demo() {\n    // TODO: value\n}\n";
+    std::fs::write(&file_path, source).unwrap();
+    let state = DaemonState::new_with_acp(runtime_dir.clone(), AcpClient::new(agent)).unwrap();
+    let params = GenerateParams {
+        file: file_path.to_string_lossy().to_string(),
+        offset: source.find("TODO").unwrap(),
+    };
+
+    let first = ipc::generate(&state, &params).await.unwrap();
+    let second = ipc::generate(&state, &params).await.unwrap();
+    assert_eq!(first.insert_text, "let value = 42;");
+    assert_eq!(second.insert_text, first.insert_text);
+    assert_eq!(state.cache.stats().await.unwrap().total_proposals, 1);
+    let anchors = ipc::anchors(
+        &state,
+        &AnchorsParams {
+            file: params.file.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(anchors[0].status, "ready");
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn generate_keeps_separate_proposals_for_anchors_in_one_function() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let agent = fake_acp(
+        &runtime_dir,
+        r##"#!/bin/sh
+read -r ignored
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}'
+read -r ignored
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"fake"}}'
+read -r ignored
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"let generated = true;"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
+"##,
+    );
+    let file_path = runtime_dir.join("fixture.rs");
+    let source = "fn demo() {\n    // TODO: first\n    let value = 0;\n    // TODO: second\n}\n";
+    std::fs::write(&file_path, source).unwrap();
+    let state = DaemonState::new_with_acp(runtime_dir.clone(), AcpClient::new(agent)).unwrap();
+
+    for offset in [
+        source.find("first").unwrap(),
+        source.find("second").unwrap(),
+    ] {
+        ipc::generate(
+            &state,
+            &GenerateParams {
+                file: file_path.to_string_lossy().to_string(),
+                offset,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(state.cache.stats().await.unwrap().total_proposals, 2);
+    let suggestions = ipc::complete(
+        &state,
+        &CompleteParams {
+            file: file_path.to_string_lossy().to_string(),
+            offset: source.find("value").unwrap(),
+            prefix: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(suggestions.len(), 2);
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn denied_acp_permission_marks_anchor_failed() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let agent = fake_acp(
+        &runtime_dir,
+        r##"#!/bin/sh
+read -r ignored
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}'
+read -r ignored
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"fake"}}'
+read -r ignored
+printf '%s\n' '{"jsonrpc":"2.0","id":9,"method":"session/request_permission","params":{"sessionId":"fake","toolCall":{"toolCallId":"write"},"options":[]}}'
+read -r denied
+"##,
+    );
+    let file_path = runtime_dir.join("fixture.rs");
+    let source = "fn demo() {\n    todo!();\n}\n";
+    std::fs::write(&file_path, source).unwrap();
+    let state = DaemonState::new_with_acp(runtime_dir.clone(), AcpClient::new(agent)).unwrap();
+
+    let error = ipc::generate(
+        &state,
+        &GenerateParams {
+            file: file_path.to_string_lossy().to_string(),
+            offset: source.find("todo").unwrap(),
+        },
+    )
+    .await
+    .expect_err("permission request should fail generation");
+    assert!(error.to_string().contains("disallowed"));
+    let anchors = ipc::anchors(
+        &state,
+        &AnchorsParams {
+            file: file_path.to_string_lossy().to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(anchors[0].status, "failed");
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn timed_out_acp_generation_marks_anchor_failed() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let agent = fake_acp(
+        &runtime_dir,
+        r##"#!/bin/sh
+while :; do :; done
+"##,
+    );
+    let file_path = runtime_dir.join("fixture.rs");
+    let source = "fn demo() {\n    todo!();\n}\n";
+    std::fs::write(&file_path, source).unwrap();
+    let state = DaemonState::new_with_acp(
+        runtime_dir.clone(),
+        AcpClient::with_timeout(agent, Duration::from_millis(10)),
+    )
+    .unwrap();
+
+    let error = ipc::generate(
+        &state,
+        &GenerateParams {
+            file: file_path.to_string_lossy().to_string(),
+            offset: source.find("todo").unwrap(),
+        },
+    )
+    .await
+    .expect_err("timed out ACP request should fail generation");
+    assert!(error.to_string().contains("timed out"));
+    let anchors = ipc::anchors(
+        &state,
+        &AnchorsParams {
+            file: file_path.to_string_lossy().to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(anchors[0].status, "failed");
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inline_uses_live_buffer_content_without_caching() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let agent = fake_acp(
+        &runtime_dir,
+        r##"#!/bin/sh
+read -r ignored
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}'
+read -r ignored
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"fake"}}'
+read -r prompt
+case "$prompt" in
+  *HARNESSD_CURSOR*unsaved_value*) ;;
+  *) exit 7 ;;
+esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"let inserted = true;"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
+"##,
+    );
+    let file_path = runtime_dir.join("fixture.rs");
+    std::fs::write(&file_path, "fn saved() {}\n").unwrap();
+    let content = "fn demo() {\n    let unsaved_value = 1;\n}\n";
+    let state = DaemonState::new_with_acp(runtime_dir.clone(), AcpClient::new(agent)).unwrap();
+
+    let suggestion = ipc::inline(
+        &state,
+        &InlineParams {
+            file: file_path.to_string_lossy().to_string(),
+            offset: content.find("unsaved_value").unwrap(),
+            content: content.to_string(),
+            prompt: "insert handling".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(suggestion.label, "Inline ask");
+    assert_eq!(suggestion.insert_text, "let inserted = true;");
+    assert_eq!(state.cache.stats().await.unwrap().total_proposals, 0);
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[tokio::test]
+async fn inline_validates_prompt_and_cursor_before_generation() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let file_path = runtime_dir.join("fixture.rs");
+    std::fs::write(&file_path, "fn saved() {}\n").unwrap();
+    let state = DaemonState::new(runtime_dir.clone()).unwrap();
+
+    for params in [
+        InlineParams {
+            file: file_path.to_string_lossy().to_string(),
+            offset: 0,
+            content: "fn x() {}".to_string(),
+            prompt: "  ".to_string(),
+        },
+        InlineParams {
+            file: file_path.to_string_lossy().to_string(),
+            offset: 99,
+            content: "fn x() {}".to_string(),
+            prompt: "ask".to_string(),
+        },
+        InlineParams {
+            file: file_path.to_string_lossy().to_string(),
+            offset: 1,
+            content: "é".to_string(),
+            prompt: "ask".to_string(),
+        },
+    ] {
+        assert!(ipc::inline(&state, &params).await.is_err());
+    }
+    assert_eq!(state.cache.stats().await.unwrap().total_proposals, 0);
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inline_rejects_disallowed_acp_tool_requests() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let agent = fake_acp(
+        &runtime_dir,
+        r##"#!/bin/sh
+read -r ignored
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}'
+read -r ignored
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"fake"}}'
+read -r ignored
+printf '%s\n' '{"jsonrpc":"2.0","id":9,"method":"session/request_permission","params":{"sessionId":"fake","toolCall":{"toolCallId":"write"},"options":[]}}'
+read -r denied
+"##,
+    );
+    let file_path = runtime_dir.join("fixture.rs");
+    std::fs::write(&file_path, "fn demo() {}\n").unwrap();
+    let state = DaemonState::new_with_acp(runtime_dir.clone(), AcpClient::new(agent)).unwrap();
+    let error = ipc::inline(
+        &state,
+        &InlineParams {
+            file: file_path.to_string_lossy().to_string(),
+            offset: 10,
+            content: "fn demo() {}\n".to_string(),
+            prompt: "fill it".to_string(),
+        },
+    )
+    .await
+    .expect_err("permission request should fail inline generation");
+    assert!(error.to_string().contains("disallowed"));
 
     std::fs::remove_dir_all(&runtime_dir).ok();
 }

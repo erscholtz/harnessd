@@ -1,5 +1,6 @@
 //! Shared daemon state: cache, parser, and runtime configuration.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,10 +8,12 @@ use std::time::Instant;
 
 use tokio::sync::RwLock;
 
+use crate::acp::AcpClient;
 use crate::cache::ProposalCache;
 use crate::parser::LanguageParsers;
 use crate::rpc::{CacheStatus, DaemonMetricsSnapshot, RecentProposal, StatusResult};
 use crate::runtime;
+use crate::threads::ThreadStore;
 
 /// Shared state for the daemon, accessible from RPC handlers.
 pub struct DaemonState {
@@ -18,17 +21,27 @@ pub struct DaemonState {
     pub cache: ProposalCache,
     /// Tree-sitter parser registry for supported languages.
     pub parser: RwLock<LanguageParsers>,
+    /// ACP process launcher used only for explicit uncached generation.
+    pub acp: AcpClient,
+    /// Persistent Neovim line-thread anchors.
+    pub threads: ThreadStore,
     /// Runtime directory for sockets, etc.
     pub runtime_dir: PathBuf,
     cache_db_path: PathBuf,
     started_at: Instant,
     started_at_unix: u64,
     metrics: DaemonMetrics,
+    failed_regions: RwLock<HashSet<String>>,
 }
 
 impl DaemonState {
     /// Create a new daemon state.
     pub fn new(runtime_dir: PathBuf) -> anyhow::Result<Arc<Self>> {
+        Self::new_with_acp(runtime_dir, AcpClient::from_env())
+    }
+
+    /// Create daemon state with an explicit ACP executable, used by deterministic tests.
+    pub fn new_with_acp(runtime_dir: PathBuf, acp: AcpClient) -> anyhow::Result<Arc<Self>> {
         let cache_path = runtime_dir.join("proposals.db");
         let cache = ProposalCache::open(&cache_path)?;
         let parser = LanguageParsers::new()?;
@@ -41,12 +54,30 @@ impl DaemonState {
         Ok(Arc::new(Self {
             cache,
             parser: RwLock::new(parser),
+            acp,
+            threads: ThreadStore::new(crate::threads::store_path(&runtime_dir)),
             runtime_dir,
             cache_db_path: cache_path,
             started_at: Instant::now(),
             started_at_unix: unix_timestamp(),
             metrics: DaemonMetrics::default(),
+            failed_regions: RwLock::new(HashSet::new()),
         }))
+    }
+
+    /// Mark a cache key as having failed its most recent explicit generation.
+    pub async fn mark_generation_failed(&self, key: String) {
+        self.failed_regions.write().await.insert(key);
+    }
+
+    /// Clear any recorded generation failure once a proposal is available.
+    pub async fn clear_generation_failed(&self, key: &str) {
+        self.failed_regions.write().await.remove(key);
+    }
+
+    /// Whether a generation attempt failed for this current file-region key.
+    pub async fn generation_failed(&self, key: &str) -> bool {
+        self.failed_regions.read().await.contains(key)
     }
 
     /// Record an incoming JSON-RPC method call for diagnostics.

@@ -79,6 +79,30 @@ async fn test_cache_store_and_lookup() {
 }
 
 #[tokio::test]
+async fn test_cache_upserts_same_region_key() {
+    let db_path = temp_db_path();
+    let cache = ProposalCache::open(&db_path).expect("failed to open cache");
+
+    cache
+        .store("/test/file.rs", 10, 20, "hash", "first", "label")
+        .await
+        .expect("failed to store initial proposal");
+    cache
+        .store("/test/file.rs", 10, 20, "hash", "second", "label")
+        .await
+        .expect("failed to update proposal");
+
+    let proposals = cache
+        .lookup("/test/file.rs", 10, 20, "hash")
+        .await
+        .expect("failed to lookup proposal");
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].snippet, "second");
+
+    std::fs::remove_file(&db_path).ok();
+}
+
+#[tokio::test]
 async fn test_cache_lookup_miss() {
     let db_path = temp_db_path();
     let cache = ProposalCache::open(&db_path).expect("failed to open cache");

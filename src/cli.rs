@@ -56,11 +56,43 @@ pub enum Commands {
         prefix: Option<String>,
     },
 
+    /// Ask ACP for ephemeral insertion text at a live-buffer cursor location.
+    Inline {
+        /// Absolute or workspace-relative source file path.
+        #[arg(long)]
+        file: PathBuf,
+        /// Cursor position as a byte offset in stdin content.
+        #[arg(long)]
+        offset: usize,
+        /// User instruction for generated insertion text.
+        #[arg(long)]
+        prompt: String,
+    },
+
     /// Warm the proposal cache for a file or workspace path.
     Prefetch {
         /// File or directory to scan for anchors.
         #[arg(long)]
         path: PathBuf,
+    },
+
+    /// List saved Codex sessions for a workspace.
+    CodexSessions {
+        /// Workspace root for project-first filtering.
+        #[arg(long)]
+        workspace: PathBuf,
+        /// Include all saved Codex sessions.
+        #[arg(long, default_value_t = false)]
+        all: bool,
+        /// Maximum number of sessions to return.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+
+    /// Manage Neovim line-anchored Codex threads.
+    Thread {
+        #[command(subcommand)]
+        command: ThreadCommands,
     },
 
     /// Send a research request to the daemon (starts daemon if needed).
@@ -85,5 +117,78 @@ pub enum Commands {
         text: Option<String>,
         #[arg(long)]
         cursor: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ThreadCommands {
+    /// Create a new line-anchored thread; live buffer content is read from stdin.
+    Create {
+        /// Workspace root.
+        #[arg(long)]
+        workspace: PathBuf,
+        /// Source file path.
+        #[arg(long)]
+        file: PathBuf,
+        /// Cursor byte offset in stdin content.
+        #[arg(long)]
+        offset: usize,
+        /// User prompt.
+        #[arg(long)]
+        prompt: String,
+        /// Optional selected start byte.
+        #[arg(long)]
+        selection_start: Option<usize>,
+        /// Optional selected end byte.
+        #[arg(long)]
+        selection_end: Option<usize>,
+    },
+    /// List anchored threads; optional live buffer content is read from stdin when provided.
+    List {
+        /// Workspace root.
+        #[arg(long)]
+        workspace: PathBuf,
+        /// Optional source file path.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Link a thread to a Codex session.
+    Link {
+        /// Thread id.
+        #[arg(long)]
+        thread_id: String,
+        /// Codex session UUID.
+        #[arg(long)]
+        session_id: String,
+        /// Optional Codex JSONL path.
+        #[arg(long)]
+        session_path: Option<PathBuf>,
+    },
+    /// Resolve a newly launched thread to a Codex session.
+    Resolve {
+        /// Thread id.
+        #[arg(long)]
+        thread_id: String,
+        /// Workspace root.
+        #[arg(long)]
+        workspace: PathBuf,
+        /// Unix timestamp captured before launching Codex.
+        #[arg(long)]
+        started_after: u64,
+    },
+    /// Attach an existing Codex session to the current source line.
+    Attach {
+        /// Workspace root.
+        #[arg(long)]
+        workspace: PathBuf,
+        /// Source file path.
+        #[arg(long)]
+        file: PathBuf,
+        /// Cursor byte offset in stdin content.
+        #[arg(long)]
+        offset: usize,
+        /// Codex session UUID.
+        #[arg(long)]
+        session_id: String,
     },
 }

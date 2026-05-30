@@ -5,8 +5,10 @@
 
 #![warn(missing_docs)]
 
+pub mod acp;
 pub mod cache;
 pub mod cli;
+pub mod codex_sessions;
 pub mod commands;
 pub mod daemon_lock;
 pub mod dashboard;
@@ -18,4 +20,5 @@ pub mod rpc;
 pub mod runtime;
 pub mod shutdown;
 pub mod state;
+pub mod threads;
 pub mod tui;
