@@ -17,13 +17,21 @@ pub const MAX_BYTES: usize = 2048;
 /// A cached proposal for a specific code region.
 #[derive(Debug, Clone)]
 pub struct Proposal {
+    /// Database row id.
     pub id: i64,
+    /// Absolute source file path.
     pub file_path: String,
+    /// Start byte of the source region.
     pub byte_start: usize,
+    /// End byte of the source region.
     pub byte_end: usize,
+    /// Content hash used to invalidate stale proposals.
     pub content_hash: String,
+    /// Completion text.
     pub snippet: String,
+    /// UI label for the proposal.
     pub label: String,
+    /// Creation timestamp as Unix seconds.
     pub created_at: i64,
 }
 
@@ -300,9 +308,13 @@ impl ProposalCache {
 /// Cache statistics for diagnostics.
 #[derive(Debug, Clone)]
 pub struct CacheStats {
+    /// Number of proposals currently stored.
     pub total_proposals: usize,
+    /// Total bytes occupied by proposal snippets.
     pub total_bytes: usize,
+    /// Oldest proposal timestamp.
     pub oldest_timestamp: Option<i64>,
+    /// Newest proposal timestamp.
     pub newest_timestamp: Option<i64>,
 }
 

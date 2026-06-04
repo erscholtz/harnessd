@@ -258,10 +258,9 @@ where
                 let update = &message["params"]["update"];
                 if update["sessionUpdate"] == "agent_message_chunk"
                     && update["content"]["type"] == "text"
+                    && let Some(text) = update["content"]["text"].as_str()
                 {
-                    if let Some(text) = update["content"]["text"].as_str() {
-                        output.push_str(text);
-                    }
+                    output.push_str(text);
                 }
                 if update["sessionUpdate"] == "tool_call"
                     && matches!(
@@ -311,12 +310,13 @@ async fn terminate_child(child: &mut Child) {
 /// Remove one accidental code fence and enforce the autocomplete bounds.
 pub fn normalize_output(output: String) -> anyhow::Result<String> {
     let mut snippet = output.trim().to_string();
-    if snippet.starts_with("```") && snippet.ends_with("```") {
-        if let Some(first_newline) = snippet.find('\n') {
-            snippet = snippet[first_newline + 1..snippet.len() - 3]
-                .trim()
-                .to_string();
-        }
+    if snippet.starts_with("```")
+        && snippet.ends_with("```")
+        && let Some(first_newline) = snippet.find('\n')
+    {
+        snippet = snippet[first_newline + 1..snippet.len() - 3]
+            .trim()
+            .to_string();
     }
     if snippet.is_empty() {
         anyhow::bail!("ACP generated an empty suggestion");

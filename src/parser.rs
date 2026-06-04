@@ -10,8 +10,11 @@ use tree_sitter::{Language, Node, Parser, Tree};
 
 /// A parsed file with its AST.
 pub struct ParsedFile {
+    /// Parsed tree-sitter syntax tree.
     pub tree: Tree,
+    /// Source text used to produce the tree.
     pub source: String,
+    /// Language selected for this file.
     pub language: SupportedLanguage,
 }
 
@@ -29,21 +32,32 @@ pub struct Anchor {
 /// Types of anchors we can detect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnchorKind {
+    /// TODO comment anchor.
     TodoComment,
+    /// FIXME comment anchor.
     FixmeComment,
+    /// Rust `todo!()` macro anchor.
     TodoMacro,
+    /// Rust `unimplemented!()` macro anchor.
     UnimplementedMacro,
+    /// Function or method with an empty body.
     EmptyFunctionBody,
 }
 
 /// Languages currently backed by tree-sitter parsers in this daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SupportedLanguage {
+    /// Rust source.
     Rust,
+    /// JavaScript source.
     JavaScript,
+    /// TypeScript source.
     TypeScript,
+    /// TSX source.
     Tsx,
+    /// Python source.
     Python,
+    /// Go source.
     Go,
 }
 
@@ -231,20 +245,19 @@ impl ParsedFile {
             }
         } else if self.language.function_kinds().contains(&node_kind)
             && self.language.supports_braced_empty_body()
+            && let Some(body) = node.child_by_field_name("body")
         {
-            if let Some(body) = node.child_by_field_name("body") {
-                let body_text = body.utf8_text(self.source.as_bytes()).unwrap_or("");
-                if normalized_body(body_text) == "{}" {
-                    let name = node
-                        .child_by_field_name("name")
-                        .and_then(|name_node| name_node.utf8_text(self.source.as_bytes()).ok())
-                        .unwrap_or("unknown");
-                    anchors.push(Anchor {
-                        byte_range: node.byte_range(),
-                        kind: AnchorKind::EmptyFunctionBody,
-                        context: format!("fn {}", name),
-                    });
-                }
+            let body_text = body.utf8_text(self.source.as_bytes()).unwrap_or("");
+            if normalized_body(body_text) == "{}" {
+                let name = node
+                    .child_by_field_name("name")
+                    .and_then(|name_node| name_node.utf8_text(self.source.as_bytes()).ok())
+                    .unwrap_or("unknown");
+                anchors.push(Anchor {
+                    byte_range: node.byte_range(),
+                    kind: AnchorKind::EmptyFunctionBody,
+                    context: format!("fn {}", name),
+                });
             }
         }
 
@@ -279,10 +292,10 @@ fn find_node_at_offset(node: Node<'_>, offset: usize) -> Option<Node<'_>> {
     }
 
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i as u32) {
-            if let Some(found) = find_node_at_offset(child, offset) {
-                return Some(found);
-            }
+        if let Some(child) = node.child(i as u32)
+            && let Some(found) = find_node_at_offset(child, offset)
+        {
+            return Some(found);
         }
     }
 

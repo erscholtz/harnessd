@@ -8,11 +8,14 @@ use clap::{Parser, Subcommand};
     version,
     about = "Local research harness (daemon + CLI + editor bridge)"
 )]
+/// Parsed command-line interface for `harnessd`.
 pub struct Cli {
+    /// Selected subcommand.
     #[command(subcommand)]
     pub command: Commands,
 }
 
+/// Top-level CLI subcommands.
 #[derive(Subcommand)]
 pub enum Commands {
     /// Run the long-lived daemon (local socket + JSON-RPC).
@@ -91,6 +94,7 @@ pub enum Commands {
 
     /// Manage Neovim line-anchored Codex threads.
     Thread {
+        /// Thread management action.
         #[command(subcommand)]
         command: ThreadCommands,
     },
@@ -110,16 +114,21 @@ pub enum Commands {
         #[arg(long)]
         method: String,
         #[arg(long)]
+        /// Optional file path.
         file: Option<PathBuf>,
         #[arg(long)]
+        /// Optional line number.
         line: Option<u32>,
         #[arg(long)]
+        /// Optional text payload.
         text: Option<String>,
         #[arg(long)]
+        /// Optional cursor payload.
         cursor: Option<String>,
     },
 }
 
+/// Subcommands for persistent Codex thread anchors.
 #[derive(Subcommand)]
 pub enum ThreadCommands {
     /// Create a new line-anchored thread; live buffer content is read from stdin.

@@ -1,5 +1,7 @@
 //! JSON-RPC 2.0 types for the daemon protocol.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 pub use crate::codex_sessions::{CodexSessionInfo, CodexSessionsParams, CodexSessionsResult};
@@ -12,29 +14,40 @@ pub use crate::threads::{
 /// A JSON-RPC 2.0 request.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JsonRpcRequest {
+    /// Protocol version; always `2.0`.
     pub jsonrpc: String,
+    /// Method name.
     pub method: String,
+    /// Optional method parameters.
     #[serde(default)]
     pub params: Option<serde_json::Value>,
+    /// Request id preserved in the response.
     pub id: Option<serde_json::Value>,
 }
 
 /// A JSON-RPC 2.0 response.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JsonRpcResponse {
+    /// Protocol version; always `2.0`.
     pub jsonrpc: String,
+    /// Successful result payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
+    /// Error payload for failed requests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
+    /// Request id copied from the request.
     pub id: Option<serde_json::Value>,
 }
 
 /// A JSON-RPC 2.0 error object.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JsonRpcError {
+    /// JSON-RPC error code.
     pub code: i32,
+    /// Human-readable error message.
     pub message: String,
+    /// Optional structured error details.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
 }
@@ -68,13 +81,15 @@ impl JsonRpcResponse {
             id,
         }
     }
+}
 
-    /// Convert to a JSON string.
-    pub fn to_string(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| {
+impl fmt::Display for JsonRpcResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = serde_json::to_string(self).unwrap_or_else(|_| {
             r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"},"id":null}"#
                 .to_string()
-        })
+        });
+        f.write_str(&value)
     }
 }
 

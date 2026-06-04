@@ -69,6 +69,7 @@ impl Drop for DaemonLock {
     }
 }
 
+/// Read a PID from a lock file, returning `None` for missing or invalid files.
 pub fn read_pid(path: &Path) -> Option<u32> {
     let s = fs::read_to_string(path).ok()?;
     s.trim().parse().ok()
@@ -89,6 +90,7 @@ pub fn read_daemon_pid(runtime_dir: &Path) -> anyhow::Result<u32> {
 }
 
 #[cfg(unix)]
+/// Whether a process with this PID appears to be alive on Unix.
 pub fn process_is_running(pid: u32) -> bool {
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -98,6 +100,7 @@ pub fn process_is_running(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
+/// Whether a process with this PID appears to be alive on Windows.
 pub fn process_is_running(pid: u32) -> bool {
     std::process::Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}")])
