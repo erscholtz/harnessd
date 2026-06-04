@@ -3,7 +3,7 @@
 use harnessd::rpc::{
     AnchorsParams, CacheStatus, CodexSessionsParams, CompleteParams, DaemonMetricsSnapshot,
     GenerateParams, InlineParams, JsonRpcRequest, JsonRpcResponse, PrefetchParams, RecentProposal,
-    StatusResult, ThreadCreateParams, ThreadListParams,
+    ScratchCreateParams, ScratchCreateResult, StatusResult, ThreadCreateParams, ThreadListParams,
 };
 
 #[test]
@@ -114,6 +114,44 @@ fn test_inline_params_roundtrip() {
     assert_eq!(decoded.offset, params.offset);
     assert_eq!(decoded.content, params.content);
     assert_eq!(decoded.prompt, params.prompt);
+}
+
+#[test]
+fn test_scratch_params_and_result_roundtrip() {
+    let params = ScratchCreateParams {
+        workspace: "/workspace".to_string(),
+        file: "/workspace/src/main.rs".to_string(),
+        offset: 12,
+        content: "fn main() {}".to_string(),
+        prompt: "sketch usage".to_string(),
+        selection_start: Some(1),
+        selection_end: Some(5),
+    };
+    let json = serde_json::to_string(&params).expect("failed to serialize scratch params");
+    let decoded: ScratchCreateParams =
+        serde_json::from_str(&json).expect("failed to deserialize scratch params");
+    assert_eq!(decoded.workspace, params.workspace);
+    assert_eq!(decoded.file, params.file);
+    assert_eq!(decoded.offset, params.offset);
+    assert_eq!(decoded.content, params.content);
+    assert_eq!(decoded.prompt, params.prompt);
+    assert_eq!(decoded.selection_start, Some(1));
+    assert_eq!(decoded.selection_end, Some(5));
+
+    let result = ScratchCreateResult {
+        path: "/workspace/scratch/harnessd/demo.rs".to_string(),
+        relative_path: "scratch/harnessd/demo.rs".to_string(),
+        bytes: 42,
+        lines: 3,
+        created_at: 1,
+        source_file: "/workspace/src/main.rs".to_string(),
+        prompt_preview: "sketch usage".to_string(),
+    };
+    let json = serde_json::to_string(&result).expect("failed to serialize scratch result");
+    let decoded: ScratchCreateResult =
+        serde_json::from_str(&json).expect("failed to deserialize scratch result");
+    assert_eq!(decoded.relative_path, "scratch/harnessd/demo.rs");
+    assert_eq!(decoded.bytes, 42);
 }
 
 #[test]

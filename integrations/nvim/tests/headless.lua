@@ -9,6 +9,10 @@ vim.api.nvim_win_set_cursor(0, { 2, 4 })
 
 local requests = {}
 local launches = {}
+local notifications = {}
+vim.notify = function(message, level)
+  notifications[#notifications + 1] = { message = message, level = level }
+end
 vim.system = function(args, opts, callback)
   requests[#requests + 1] = { args = args, opts = opts }
   local method = args[2]
@@ -20,6 +24,18 @@ vim.system = function(args, opts, callback)
   elseif method == "complete" then
     stdout = vim.json.encode({
       result = { suggestions = { { insert_text = "cached_value" } } },
+    })
+  elseif method == "scratch" then
+    stdout = vim.json.encode({
+      result = {
+        path = vim.fn.getcwd() .. "/scratch/harnessd/demo.rs",
+        relative_path = "scratch/harnessd/demo.rs",
+        bytes = 42,
+        lines = 3,
+        created_at = 1,
+        source_file = fixture,
+        prompt_preview = "sketch a scratch file",
+      },
     })
   elseif method == "thread" and args[3] == "create" then
     stdout = vim.json.encode({
@@ -101,9 +117,11 @@ h.setup({
 })
 assert(vim.fn.exists(":HarnessdAsk") == 2)
 assert(vim.fn.exists(":HarnessdInline") == 2)
+assert(vim.fn.exists(":HarnessdScratch") == 2)
 assert(vim.fn.exists(":HarnessdThreads") == 2)
 assert(vim.fn.exists(":HarnessdAccept") == 2)
 assert(vim.fn.maparg("<Plug>(HarnessdAccept)", "n") ~= "")
+assert(vim.fn.maparg("<Plug>(HarnessdScratch)", "n") ~= "")
 
 h.inline_ask()
 assert(#vim.api.nvim_list_wins() == 2, "ask should create a floating prompt window")
@@ -158,6 +176,41 @@ h.accept()
 local after = table.concat(vim.api.nvim_buf_get_lines(source, 0, -1, false), "\n")
 assert(after == before, "stale preview must not insert")
 assert(#vim.api.nvim_buf_get_extmarks(source, ns, 0, -1, {}) == 0)
+
+vim.api.nvim_set_current_buf(source)
+local scratch_before = table.concat(vim.api.nvim_buf_get_lines(source, 0, -1, false), "\n")
+h.scratch_ask()
+local scratch_prompt = vim.api.nvim_get_current_buf()
+vim.api.nvim_buf_set_lines(scratch_prompt, 0, -1, false, { "sketch a scratch file" })
+local scratch_submitted = false
+for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(scratch_prompt, "i")) do
+  if mapping.lhs == "<CR>" then
+    mapping.callback()
+    scratch_submitted = true
+  end
+end
+assert(scratch_submitted, "scratch prompt should install a submit mapping")
+vim.wait(1000, function()
+  return requests[#requests] and requests[#requests].args[2] == "scratch"
+end)
+assert(requests[#requests].opts.stdin:find("fn changed", 1, true))
+assert(table.concat(vim.api.nvim_buf_get_lines(source, 0, -1, false), "\n") == scratch_before)
+assert(#vim.api.nvim_buf_get_extmarks(source, ns, 0, -1, {}) == 0)
+vim.wait(1000, function()
+  for _, notification in ipairs(notifications) do
+    if notification.message == "harnessd scratch: scratch/harnessd/demo.rs" then
+      return true
+    end
+  end
+  return false
+end)
+local scratch_notified = false
+for _, notification in ipairs(notifications) do
+  if notification.message == "harnessd scratch: scratch/harnessd/demo.rs" then
+    scratch_notified = true
+  end
+end
+assert(scratch_notified, "scratch should notify the created relative path")
 
 vim.api.nvim_set_current_buf(source)
 h.thread_ask()

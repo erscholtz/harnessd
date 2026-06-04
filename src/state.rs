@@ -13,6 +13,7 @@ use crate::cache::ProposalCache;
 use crate::parser::LanguageParsers;
 use crate::rpc::{CacheStatus, DaemonMetricsSnapshot, RecentProposal, StatusResult};
 use crate::runtime;
+use crate::scratch::ScratchClient;
 use crate::threads::ThreadStore;
 
 /// Shared state for the daemon, accessible from RPC handlers.
@@ -23,6 +24,8 @@ pub struct DaemonState {
     pub parser: RwLock<LanguageParsers>,
     /// ACP process launcher used only for explicit uncached generation.
     pub acp: AcpClient,
+    /// Codex process launcher used for saved scratch preview artifacts.
+    pub scratch: ScratchClient,
     /// Persistent Neovim line-thread anchors.
     pub threads: ThreadStore,
     /// Runtime directory for sockets, etc.
@@ -42,6 +45,16 @@ impl DaemonState {
 
     /// Create daemon state with an explicit ACP executable, used by deterministic tests.
     pub fn new_with_acp(runtime_dir: PathBuf, acp: AcpClient) -> anyhow::Result<Arc<Self>> {
+        let scratch = ScratchClient::from_env(runtime_dir.clone());
+        Self::new_with_clients(runtime_dir, acp, scratch)
+    }
+
+    /// Create daemon state with explicit generation clients, used by deterministic tests.
+    pub fn new_with_clients(
+        runtime_dir: PathBuf,
+        acp: AcpClient,
+        scratch: ScratchClient,
+    ) -> anyhow::Result<Arc<Self>> {
         let cache_path = runtime_dir.join("proposals.db");
         let cache = ProposalCache::open(&cache_path)?;
         let parser = LanguageParsers::new()?;
@@ -55,6 +68,7 @@ impl DaemonState {
             cache,
             parser: RwLock::new(parser),
             acp,
+            scratch,
             threads: ThreadStore::new(crate::threads::store_path(&runtime_dir)),
             runtime_dir,
             cache_db_path: cache_path,

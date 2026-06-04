@@ -72,6 +72,28 @@ pub enum Commands {
         prompt: String,
     },
 
+    /// Generate a saved scratch preview file from live-buffer context.
+    Scratch {
+        /// Workspace root.
+        #[arg(long)]
+        workspace: PathBuf,
+        /// Absolute or workspace-relative source file path.
+        #[arg(long)]
+        file: PathBuf,
+        /// Cursor position as a byte offset in stdin content.
+        #[arg(long)]
+        offset: usize,
+        /// User instruction for the scratch preview.
+        #[arg(long)]
+        prompt: String,
+        /// Optional selected start byte.
+        #[arg(long)]
+        selection_start: Option<usize>,
+        /// Optional selected end byte.
+        #[arg(long)]
+        selection_end: Option<usize>,
+    },
+
     /// Warm the proposal cache for a file or workspace path.
     Prefetch {
         /// File or directory to scan for anchors.

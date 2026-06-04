@@ -31,6 +31,8 @@ pub mod paths;
 pub mod rpc;
 /// Runtime health inspection.
 pub mod runtime;
+/// Scratch preview artifact generation.
+pub mod scratch;
 /// Shutdown signal handling.
 pub mod shutdown;
 /// Shared daemon state.

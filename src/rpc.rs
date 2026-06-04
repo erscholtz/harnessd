@@ -134,6 +134,46 @@ pub struct InlineParams {
     pub prompt: String,
 }
 
+/// Parameters for creating a saved scratch preview artifact.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ScratchCreateParams {
+    /// Absolute workspace root.
+    pub workspace: String,
+    /// Absolute source file path used for context and extension selection.
+    pub file: String,
+    /// Cursor position as a byte offset into `content`.
+    pub offset: usize,
+    /// Current editor buffer contents, including unsaved edits.
+    pub content: String,
+    /// User instruction for the scratch preview.
+    pub prompt: String,
+    /// Optional selected start byte.
+    #[serde(default)]
+    pub selection_start: Option<usize>,
+    /// Optional selected end byte.
+    #[serde(default)]
+    pub selection_end: Option<usize>,
+}
+
+/// Result returned after writing a scratch preview artifact.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ScratchCreateResult {
+    /// Absolute path to the created scratch file.
+    pub path: String,
+    /// Workspace-relative path to the created scratch file.
+    pub relative_path: String,
+    /// Number of bytes written.
+    pub bytes: usize,
+    /// Number of lines written.
+    pub lines: usize,
+    /// Creation timestamp as Unix seconds.
+    pub created_at: u64,
+    /// Absolute source file path used as context.
+    pub source_file: String,
+    /// Bounded prompt preview.
+    pub prompt_preview: String,
+}
+
 /// An anchor reported for an editor buffer.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnchorInfo {

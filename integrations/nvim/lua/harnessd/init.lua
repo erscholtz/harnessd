@@ -66,6 +66,30 @@ local function position(bufnr)
   }, nil
 end
 
+local function mark_offset(bufnr, mark)
+  local pos = vim.api.nvim_buf_get_mark(bufnr, mark)
+  if not pos or pos[1] <= 0 then
+    return nil
+  end
+  local line_offset = vim.api.nvim_buf_get_offset(bufnr, pos[1] - 1)
+  if line_offset < 0 then
+    return nil
+  end
+  return line_offset + pos[2]
+end
+
+local function visual_selection(bufnr)
+  local start_offset = mark_offset(bufnr, "<")
+  local end_offset = mark_offset(bufnr, ">")
+  if not start_offset or not end_offset then
+    return nil, nil
+  end
+  if end_offset < start_offset then
+    start_offset, end_offset = end_offset, start_offset
+  end
+  return start_offset, end_offset
+end
+
 local function buffer_content(bufnr)
   local content = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, true), "\n")
   if vim.bo[bufnr].endofline then
@@ -239,6 +263,55 @@ function M.inline(opts, callback)
     "--prompt",
     prompt_text,
   }, {
+    stdin = opts.content or buffer_content(bufnr),
+  }, callback)
+end
+
+function M.scratch(opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
+  local bufnr = opts.bufnr or vim.api.nvim_get_current_buf()
+  local file = opts.file or select(1, current_file(bufnr))
+  local prompt_text = opts.prompt
+  if not file then
+    callback(nil, "file path is required")
+    return
+  end
+  if not prompt_text or prompt_text:match("^%s*$") then
+    callback(nil, "scratch prompt must not be empty")
+    return
+  end
+
+  local offset = opts.offset
+  if offset == nil then
+    local current = select(1, position(bufnr))
+    offset = current and current.offset or nil
+  end
+  if offset == nil then
+    callback(nil, "byte offset is required")
+    return
+  end
+
+  local args = {
+    config.command,
+    "scratch",
+    "--workspace",
+    opts.workspace or workspace(),
+    "--file",
+    file,
+    "--offset",
+    tostring(offset),
+    "--prompt",
+    prompt_text,
+  }
+  if opts.selection_start ~= nil and opts.selection_end ~= nil then
+    table.insert(args, "--selection-start")
+    table.insert(args, tostring(opts.selection_start))
+    table.insert(args, "--selection-end")
+    table.insert(args, tostring(opts.selection_end))
+  end
+
+  run_command(args, {
     stdin = opts.content or buffer_content(bufnr),
   }, callback)
 end
@@ -728,6 +801,77 @@ function M.sidebar_open_selected()
   end
 end
 
+function M.scratch_ask(opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
+  M.dismiss()
+  local source_bufnr = opts.bufnr or vim.api.nvim_get_current_buf()
+  local file, file_err = current_file(source_bufnr)
+  local cursor, cursor_err = position(source_bufnr)
+  if not file or not cursor then
+    vim.notify(file_err or cursor_err, vim.log.levels.ERROR)
+    return
+  end
+  local content = buffer_content(source_bufnr)
+  local selection_start = opts.selection_start
+  local selection_end = opts.selection_end
+  if opts.use_visual_selection then
+    selection_start, selection_end = visual_selection(source_bufnr)
+  end
+
+  local prompt_bufnr = vim.api.nvim_create_buf(false, true)
+  vim.bo[prompt_bufnr].buftype = "prompt"
+  vim.fn.prompt_setprompt(prompt_bufnr, "> ")
+  local width = math.max(30, math.min(80, vim.o.columns - 6))
+  local winid = vim.api.nvim_open_win(prompt_bufnr, true, {
+    relative = "editor",
+    row = math.max(1, math.floor(vim.o.lines / 3)),
+    col = math.max(0, math.floor((vim.o.columns - width) / 2)),
+    width = width,
+    height = 1,
+    style = "minimal",
+    border = "rounded",
+    title = " Harnessd Scratch ",
+    title_pos = "center",
+  })
+  prompt = { bufnr = prompt_bufnr, winid = winid }
+
+  local function submit()
+    local value = vim.api.nvim_buf_get_lines(prompt_bufnr, 0, 1, false)[1] or ""
+    value = value:gsub("^> ", "")
+    if value:match("^%s*$") then
+      vim.notify("scratch prompt must not be empty", vim.log.levels.WARN)
+      return
+    end
+    close_prompt()
+    M.scratch({
+      bufnr = source_bufnr,
+      workspace = workspace(),
+      file = file,
+      offset = cursor.offset,
+      content = content,
+      prompt = value,
+      selection_start = selection_start,
+      selection_end = selection_end,
+    }, function(response, err)
+      if err then
+        vim.notify(err, vim.log.levels.ERROR)
+        callback(nil, err)
+        return
+      end
+      local result = (response or {}).result or {}
+      if result.relative_path then
+        vim.notify("harnessd scratch: " .. result.relative_path, vim.log.levels.INFO)
+      end
+      callback(response, nil)
+    end)
+  end
+
+  vim.keymap.set("i", "<CR>", submit, { buffer = prompt_bufnr, nowait = true })
+  vim.keymap.set({ "i", "n" }, "<Esc>", M.dismiss, { buffer = prompt_bufnr, nowait = true })
+  vim.cmd("startinsert")
+end
+
 function M.thread_ask(opts, callback)
   opts = opts or {}
   callback = callback or function() end
@@ -869,6 +1013,9 @@ function M.setup(opts)
   end, {})
   vim.api.nvim_create_user_command("HarnessdAsk", function() M.thread_ask() end, {})
   vim.api.nvim_create_user_command("HarnessdInline", function() M.inline_ask() end, {})
+  vim.api.nvim_create_user_command("HarnessdScratch", function(command)
+    M.scratch_ask({ use_visual_selection = command.range and command.range > 0 })
+  end, { range = true })
   vim.api.nvim_create_user_command("HarnessdThreads", function() M.sidebar_toggle() end, {})
   vim.api.nvim_create_user_command("HarnessdThreadOpen", function() M.thread_open_current() end, {})
   vim.api.nvim_create_user_command("HarnessdThreadAttach", function() M.thread_attach_current() end, {})
@@ -886,6 +1033,8 @@ function M.setup(opts)
 
   vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdAsk)", function() M.thread_ask() end)
   vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdInline)", function() M.inline_ask() end)
+  vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdScratch)", function() M.scratch_ask() end)
+  vim.keymap.set("v", "<Plug>(HarnessdScratch)", function() M.scratch_ask({ use_visual_selection = true }) end)
   vim.keymap.set("n", "<Plug>(HarnessdThreads)", function() M.sidebar_toggle() end)
   vim.keymap.set("n", "<Plug>(HarnessdThreadOpen)", function() M.thread_open_current() end)
   vim.keymap.set("n", "<Plug>(HarnessdThreadAttach)", function() M.thread_attach_current() end)

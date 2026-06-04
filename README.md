@@ -41,6 +41,9 @@ Requests are JSON-RPC 2.0. Implemented methods:
   over stdio ACP.
 - `inline({ file, offset, content, prompt })` returns ephemeral bounded ACP
   insertion text using the editor's live buffer; it is not written to cache.
+- `scratch.create({ workspace, file, offset, content, prompt, selection_start,
+  selection_end })` runs read-only `codex exec` and writes one preview artifact
+  under `<workspace>/scratch/harnessd/`; it is not written to cache.
 - `complete({ file, offset, prefix })` remains a cache-only lookup.
 - `prefetch({ path })` remains a debug/cache warming path.
 
@@ -154,6 +157,16 @@ which sends live buffer contents through:
 printf '%s' "$BUFFER_CONTENT" | harnessd inline --file src/main.rs --offset 10 --prompt "insert validation"
 ```
 
+`:HarnessdScratch` is for preview/MVP examples outside the source buffer. It
+sends the current live buffer through:
+
+```bash
+printf '%s' "$BUFFER_CONTENT" | harnessd scratch --workspace . --file src/main.rs --offset 10 --prompt "sketch a usage example"
+```
+
+The daemon runs `codex exec` in read-only mode, then `harnessd` writes the
+single generated artifact under `scratch/harnessd/` and reports the path.
+
 Use `:HarnessdThreads` to toggle the Codex thread sidebar. Use
 `:HarnessdComplete` to preview a saved-file cache hit, then
 `:HarnessdAccept` or `:HarnessdDismiss` to resolve either preview.
@@ -167,6 +180,7 @@ cargo test
 ## Project layout
 
 - `src/main.rs`: binary entrypoint
+- `src/scratch.rs`: read-only Codex scratch preview generation
 - `integrations/`: editor and IDE integration assets
 - `Cargo.toml`: crate metadata + dependencies
 - `Cargo.lock`: resolved dependency graph (checked in)
@@ -189,5 +203,7 @@ cargo test
   preview and guarded acceptance
 - Neovim can create persistent line-anchored Codex threads and reopen saved
   Codex CLI sessions without owning Codex auth or model state
+- Neovim can request single-file scratch previews under `scratch/harnessd/`
+  without editing the source buffer or populating the completion cache
 - background cache warming, priority, and latency/cache-hit metrics remain
   autocomplete follow-up work

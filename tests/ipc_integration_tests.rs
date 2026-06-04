@@ -8,8 +8,9 @@ use harnessd::acp::AcpClient;
 use harnessd::ipc;
 use harnessd::rpc::{
     AnchorsParams, CompleteParams, GenerateParams, InlineParams, PrefetchParams,
-    ThreadCreateParams, ThreadLinkParams, ThreadListParams,
+    ScratchCreateParams, ThreadCreateParams, ThreadLinkParams, ThreadListParams,
 };
+use harnessd::scratch::ScratchClient;
 use harnessd::state::DaemonState;
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -34,6 +35,11 @@ fn fake_acp(runtime_dir: &std::path::Path, body: &str) -> PathBuf {
     permissions.set_mode(0o755);
     std::fs::set_permissions(&path, permissions).unwrap();
     path
+}
+
+#[cfg(unix)]
+fn fake_codex(runtime_dir: &std::path::Path, body: &str) -> PathBuf {
+    fake_acp(runtime_dir, body)
 }
 
 #[tokio::test]
@@ -548,6 +554,198 @@ read -r denied
     .await
     .expect_err("permission request should fail inline generation");
     assert!(error.to_string().contains("disallowed"));
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scratch_create_launches_read_only_codex_and_writes_artifact() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let args_log = runtime_dir.join("codex-args.txt");
+    let prompt_log = runtime_dir.join("codex-prompt.txt");
+    let fake = fake_codex(
+        &runtime_dir,
+        &format!(
+            r##"#!/bin/sh
+printf '%s\n' "$@" > "{args_log}"
+cat > "{prompt_log}"
+out=""
+next=0
+for arg in "$@"; do
+  if [ "$next" = "1" ]; then
+    out="$arg"
+    next=0
+  elif [ "$arg" = "--output-last-message" ]; then
+    next=1
+  fi
+done
+printf '%s\n' '{{"title":"Usage sketch","body":"fn main() {{\n    println!(\"scratch\");\n}}"}}' > "$out"
+"##,
+            args_log = args_log.display(),
+            prompt_log = prompt_log.display()
+        ),
+    );
+    let workspace = runtime_dir.join("workspace");
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    let file_path = workspace.join("src").join("main.rs");
+    let source = "fn demo() {\n    let unsaved_value = 1;\n}\n";
+    std::fs::write(&file_path, "fn saved() {}\n").unwrap();
+    let state = DaemonState::new_with_clients(
+        runtime_dir.clone(),
+        AcpClient::new(runtime_dir.join("unused-acp")),
+        ScratchClient::new(fake, runtime_dir.clone()),
+    )
+    .unwrap();
+
+    let result = ipc::scratch_create(
+        &state,
+        &ScratchCreateParams {
+            workspace: workspace.to_string_lossy().to_string(),
+            file: file_path.to_string_lossy().to_string(),
+            offset: source.find("unsaved_value").unwrap(),
+            content: source.to_string(),
+            prompt: "sketch usage".to_string(),
+            selection_start: None,
+            selection_end: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let args = std::fs::read_to_string(args_log).unwrap();
+    assert!(args.contains("--ask-for-approval\nnever"));
+    assert!(args.contains("--sandbox\nread-only"));
+    assert!(args.contains("--cd\n"));
+    assert!(args.contains(&workspace.to_string_lossy().to_string()));
+    let prompt = std::fs::read_to_string(prompt_log).unwrap();
+    assert!(prompt.contains("unsaved_value"));
+    assert!(prompt.contains("must not edit files"));
+    assert!(result.relative_path.starts_with("scratch/harnessd/"));
+    assert!(result.relative_path.ends_with(".rs"));
+    let written = std::fs::read_to_string(&result.path).unwrap();
+    assert!(written.contains("harnessd scratch preview"));
+    assert!(written.contains("println!(\"scratch\")"));
+    assert_eq!(
+        std::fs::read_to_string(&file_path).unwrap(),
+        "fn saved() {}\n"
+    );
+    assert_eq!(state.cache.stats().await.unwrap().total_proposals, 0);
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scratch_rejects_malformed_and_oversized_codex_output_without_writing() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let malformed = fake_codex(
+        &runtime_dir,
+        r##"#!/bin/sh
+out=""
+next=0
+for arg in "$@"; do
+  if [ "$next" = "1" ]; then out="$arg"; next=0; elif [ "$arg" = "--output-last-message" ]; then next=1; fi
+done
+printf '%s\n' 'not json' > "$out"
+"##,
+    );
+    let workspace = runtime_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let file_path = workspace.join("main.rs");
+    std::fs::write(&file_path, "fn saved() {}\n").unwrap();
+    let params = ScratchCreateParams {
+        workspace: workspace.to_string_lossy().to_string(),
+        file: file_path.to_string_lossy().to_string(),
+        offset: 0,
+        content: "fn live() {}\n".to_string(),
+        prompt: "sketch usage".to_string(),
+        selection_start: None,
+        selection_end: None,
+    };
+    let state = DaemonState::new_with_clients(
+        runtime_dir.clone(),
+        AcpClient::new(runtime_dir.join("unused-acp")),
+        ScratchClient::new(malformed, runtime_dir.clone()),
+    )
+    .unwrap();
+    assert!(ipc::scratch_create(&state, &params).await.is_err());
+    assert!(!workspace.join("scratch").exists());
+
+    let oversized = fake_codex(
+        &runtime_dir,
+        r##"#!/bin/sh
+out=""
+next=0
+for arg in "$@"; do
+  if [ "$next" = "1" ]; then out="$arg"; next=0; elif [ "$arg" = "--output-last-message" ]; then next=1; fi
+done
+{
+  printf '{"title":"Big","body":"'
+  i=0
+  while [ "$i" -lt 401 ]; do
+    printf 'line\\n'
+    i=$((i + 1))
+  done
+  printf '"}\n'
+} > "$out"
+"##,
+    );
+    let state = DaemonState::new_with_clients(
+        runtime_dir.clone(),
+        AcpClient::new(runtime_dir.join("unused-acp")),
+        ScratchClient::new(oversized, runtime_dir.clone()),
+    )
+    .unwrap();
+    assert!(ipc::scratch_create(&state, &params).await.is_err());
+    assert!(!workspace.join("scratch").exists());
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn scratch_uses_create_new_and_does_not_overwrite_existing_artifact() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let fake = fake_codex(
+        &runtime_dir,
+        r##"#!/bin/sh
+out=""
+next=0
+for arg in "$@"; do
+  if [ "$next" = "1" ]; then out="$arg"; next=0; elif [ "$arg" = "--output-last-message" ]; then next=1; fi
+done
+printf '%s\n' '{"title":"Demo","body":"fn main() {}"}' > "$out"
+"##,
+    );
+    let workspace = runtime_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let file_path = workspace.join("main.rs");
+    std::fs::write(&file_path, "fn saved() {}\n").unwrap();
+    let state = DaemonState::new_with_clients(
+        runtime_dir.clone(),
+        AcpClient::new(runtime_dir.join("unused-acp")),
+        ScratchClient::new(fake, runtime_dir.clone()),
+    )
+    .unwrap();
+    let params = ScratchCreateParams {
+        workspace: workspace.to_string_lossy().to_string(),
+        file: file_path.to_string_lossy().to_string(),
+        offset: 0,
+        content: "fn live() {}\n".to_string(),
+        prompt: "same prompt".to_string(),
+        selection_start: None,
+        selection_end: None,
+    };
+
+    let first = ipc::scratch_create(&state, &params).await.unwrap();
+    let second = ipc::scratch_create(&state, &params).await.unwrap();
+    assert_ne!(first.path, second.path);
+    assert!(std::path::Path::new(&first.path).exists());
+    assert!(std::path::Path::new(&second.path).exists());
 
     std::fs::remove_dir_all(&runtime_dir).ok();
 }

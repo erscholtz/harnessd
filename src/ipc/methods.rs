@@ -13,8 +13,8 @@ use crate::parser::{Anchor, AnchorKind, LanguageParsers, ParsedFile, SupportedLa
 use crate::rpc::{
     AnchorInfo, AnchorsParams, CodexSessionsParams, CompleteParams, CompletionSuggestion,
     GenerateParams, InlineParams, JsonRpcRequest, JsonRpcResponse, PrefetchParams, PrefetchResult,
-    StatusResult, ThreadAttachParams, ThreadCreateParams, ThreadLinkParams, ThreadListParams,
-    ThreadResolveParams,
+    ScratchCreateParams, StatusResult, ThreadAttachParams, ThreadCreateParams, ThreadLinkParams,
+    ThreadListParams, ThreadResolveParams,
 };
 use crate::state::DaemonState;
 
@@ -172,6 +172,7 @@ async fn process_request(
         "anchors" => handle_anchors(request, state).await,
         "generate" => handle_generate(request, state).await,
         "inline" => handle_inline(request, state).await,
+        "scratch.create" => handle_scratch_create(request, state).await,
         "codex.sessions" => handle_codex_sessions(request).await,
         "thread.create" => handle_thread_create(request, state).await,
         "thread.list" => handle_thread_list(request, state).await,
@@ -392,6 +393,25 @@ async fn handle_inline(request: JsonRpcRequest, state: &Arc<DaemonState>) -> Jso
             request.id,
             -32001,
             format!("Inline generation failed: {e}"),
+            Some(serde_json::json!({ "retryable": true })),
+        ),
+    }
+}
+
+async fn handle_scratch_create(
+    request: JsonRpcRequest,
+    state: &Arc<DaemonState>,
+) -> JsonRpcResponse {
+    let params: ScratchCreateParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return *response,
+    };
+    match scratch_create(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => JsonRpcResponse::error(
+            request.id,
+            -32001,
+            format!("Scratch generation failed: {e}"),
             Some(serde_json::json!({ "retryable": true })),
         ),
     }
@@ -670,6 +690,14 @@ pub async fn inline(
         detail: Some("generated through ACP inline ask".to_string()),
         documentation: None,
     })
+}
+
+/// Create a saved scratch preview artifact using live-buffer context.
+pub async fn scratch_create(
+    state: &Arc<DaemonState>,
+    params: &ScratchCreateParams,
+) -> anyhow::Result<crate::rpc::ScratchCreateResult> {
+    crate::scratch::create(&state.scratch, params).await
 }
 
 /// List Codex sessions for a workspace.

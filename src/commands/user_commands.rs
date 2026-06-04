@@ -12,8 +12,9 @@ use crate::daemon_lock::{DaemonLock, read_daemon_pid};
 use crate::paths;
 use crate::rpc::{
     AnchorsParams, CodexSessionsParams, CompleteParams, GenerateParams, InlineParams,
-    JsonRpcRequest, PrefetchParams, PrefetchResult, StatusResult, ThreadAttachParams,
-    ThreadCreateParams, ThreadLinkParams, ThreadListParams, ThreadResolveParams,
+    JsonRpcRequest, PrefetchParams, PrefetchResult, ScratchCreateParams, StatusResult,
+    ThreadAttachParams, ThreadCreateParams, ThreadLinkParams, ThreadListParams,
+    ThreadResolveParams,
 };
 use crate::runtime;
 
@@ -37,6 +38,24 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
             offset,
             prompt,
         } => run_inline(&file, offset, &prompt).await,
+        Commands::Scratch {
+            workspace,
+            file,
+            offset,
+            prompt,
+            selection_start,
+            selection_end,
+        } => {
+            run_scratch(
+                &workspace,
+                &file,
+                offset,
+                &prompt,
+                selection_start,
+                selection_end,
+            )
+            .await
+        }
         Commands::Prefetch { path } => run_prefetch(&path).await,
         Commands::CodexSessions {
             workspace,
@@ -290,6 +309,31 @@ async fn read_stdin_optional() -> anyhow::Result<String> {
     Ok(content)
 }
 
+async fn run_scratch(
+    workspace: &Path,
+    file: &Path,
+    offset: usize,
+    prompt: &str,
+    selection_start: Option<usize>,
+    selection_end: Option<usize>,
+) -> anyhow::Result<()> {
+    let content = read_stdin_optional().await?;
+    if content.is_empty() {
+        anyhow::bail!("`scratch` requires live buffer contents on stdin");
+    }
+    let request = build_scratch_request(
+        workspace,
+        file,
+        offset,
+        prompt,
+        content,
+        selection_start,
+        selection_end,
+    )?;
+    println!("{}", send_rpc_request(&request).await?);
+    Ok(())
+}
+
 fn build_inline_request(
     file: &Path,
     offset: usize,
@@ -309,6 +353,35 @@ fn build_inline_request(
             offset,
             content,
             prompt: prompt.to_string(),
+        }),
+    )
+}
+
+fn build_scratch_request(
+    workspace: &Path,
+    file: &Path,
+    offset: usize,
+    prompt: &str,
+    content: String,
+    selection_start: Option<usize>,
+    selection_end: Option<usize>,
+) -> anyhow::Result<JsonRpcRequest> {
+    if prompt.trim().is_empty() {
+        anyhow::bail!("`--prompt` must not be empty for `scratch`");
+    }
+    if content.is_empty() {
+        anyhow::bail!("`scratch` requires live buffer contents on stdin");
+    }
+    rpc_request(
+        "scratch.create",
+        Some(ScratchCreateParams {
+            workspace: canonicalize_rpc_path(workspace)?,
+            file: canonicalize_rpc_path(file)?,
+            offset,
+            content,
+            prompt: prompt.to_string(),
+            selection_start,
+            selection_end,
         }),
     )
 }
@@ -788,8 +861,10 @@ fn canonicalize_rpc_path(path: &Path) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_bridge_request, build_inline_request};
-    use crate::rpc::{CompleteParams, GenerateParams, InlineParams, PrefetchParams};
+    use super::{build_bridge_request, build_inline_request, build_scratch_request};
+    use crate::rpc::{
+        CompleteParams, GenerateParams, InlineParams, PrefetchParams, ScratchCreateParams,
+    };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -903,6 +978,49 @@ mod tests {
         let file = temp_file_path("fixture.rs");
         assert!(build_inline_request(&file, 0, "ask", String::new()).is_err());
         assert!(build_inline_request(&file, 0, " ", "fn x() {}".into()).is_err());
+
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();
+    }
+
+    #[test]
+    fn scratch_builds_request_from_live_buffer_content() {
+        let file = temp_file_path("fixture.rs");
+        let workspace = file.parent().unwrap().to_path_buf();
+        let request = build_scratch_request(
+            &workspace,
+            &file,
+            7,
+            "sketch usage",
+            "fn unsaved() {}".into(),
+            Some(1),
+            Some(5),
+        )
+        .expect("failed to build scratch request");
+        assert_eq!(request.method, "scratch.create");
+        let params: ScratchCreateParams =
+            serde_json::from_value(request.params.expect("missing params")).expect("bad params");
+        assert_eq!(params.offset, 7);
+        assert_eq!(params.prompt, "sketch usage");
+        assert_eq!(params.content, "fn unsaved() {}");
+        assert_eq!(params.selection_start, Some(1));
+        assert_eq!(params.selection_end, Some(5));
+
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();
+    }
+
+    #[test]
+    fn scratch_rejects_empty_content_and_prompt() {
+        let file = temp_file_path("fixture.rs");
+        let workspace = file.parent().unwrap().to_path_buf();
+        assert!(
+            build_scratch_request(&workspace, &file, 0, "ask", String::new(), None, None).is_err()
+        );
+        assert!(
+            build_scratch_request(&workspace, &file, 0, " ", "fn x() {}".into(), None, None)
+                .is_err()
+        );
 
         std::fs::remove_file(&file).ok();
         std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();

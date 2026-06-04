@@ -116,6 +116,45 @@ fn parses_inline_flags() {
 }
 
 #[test]
+fn parses_scratch_flags() {
+    let cli = Cli::parse_from([
+        "harnessd",
+        "scratch",
+        "--workspace",
+        ".",
+        "--file",
+        "src/main.rs",
+        "--offset",
+        "12",
+        "--prompt",
+        "sketch usage",
+        "--selection-start",
+        "1",
+        "--selection-end",
+        "5",
+    ]);
+
+    match cli.command {
+        Commands::Scratch {
+            workspace,
+            file,
+            offset,
+            prompt,
+            selection_start,
+            selection_end,
+        } => {
+            assert_eq!(workspace, std::path::PathBuf::from("."));
+            assert_eq!(file, std::path::PathBuf::from("src/main.rs"));
+            assert_eq!(offset, 12);
+            assert_eq!(prompt, "sketch usage");
+            assert_eq!(selection_start, Some(1));
+            assert_eq!(selection_end, Some(5));
+        }
+        _ => panic!("expected scratch command"),
+    }
+}
+
+#[test]
 fn parses_codex_sessions_flags() {
     let cli = Cli::parse_from([
         "harnessd",
