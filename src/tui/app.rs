@@ -406,6 +406,22 @@ fn metrics_panel(snapshot: &DashboardSnapshot) -> Paragraph<'static> {
         vec![
             kv("Total requests", status.metrics.total_requests.to_string()),
             kv("complete()", status.metrics.complete_requests.to_string()),
+            kv(
+                "inline.fast()",
+                status.metrics.inline_fast_requests.to_string(),
+            ),
+            kv(
+                "fast cache hits",
+                status.metrics.inline_fast_cache_hits.to_string(),
+            ),
+            kv(
+                "fast refresh",
+                format!(
+                    "{} queued / {} done",
+                    status.metrics.inline_fast_refresh_queued,
+                    status.metrics.inline_fast_refresh_completed
+                ),
+            ),
             kv("prefetch()", status.metrics.prefetch_requests.to_string()),
             kv("status()", status.metrics.status_requests.to_string()),
             kv("shutdown()", status.metrics.shutdown_requests.to_string()),

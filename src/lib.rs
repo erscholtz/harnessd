@@ -7,6 +7,8 @@
 
 /// ACP client wrapper used for explicit generation requests.
 pub mod acp;
+/// Live-buffer inline autocomplete orchestration.
+pub mod autocomplete;
 /// SQLite-backed proposal cache.
 pub mod cache;
 /// Command-line argument definitions.
@@ -23,6 +25,8 @@ pub mod dashboard;
 pub mod ipc;
 /// Editor-facing LSP adapter.
 pub mod lsp;
+/// Model override validation and config rendering.
+pub mod models;
 /// Tree-sitter parsing and anchor detection.
 pub mod parser;
 /// Runtime path helpers.

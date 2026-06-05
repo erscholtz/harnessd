@@ -8,18 +8,16 @@ use anyhow::Context;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-use crate::acp::{GenerationContext, InlineContext};
+use crate::acp::GenerationContext;
 use crate::parser::{Anchor, AnchorKind, LanguageParsers, ParsedFile, SupportedLanguage};
 use crate::rpc::{
     AnchorInfo, AnchorsParams, CodexSessionsParams, CompleteParams, CompletionSuggestion,
-    GenerateParams, InlineParams, JsonRpcRequest, JsonRpcResponse, PrefetchParams, PrefetchResult,
-    ScratchCreateParams, StatusResult, ThreadAttachParams, ThreadCreateParams, ThreadLinkParams,
-    ThreadListParams, ThreadResolveParams,
+    GenerateParams, InlineFastParams, InlineParams, InlinePrepareParams, JsonRpcRequest,
+    JsonRpcResponse, PrefetchParams, PrefetchResult, ScratchCreateParams, StatusResult,
+    ThreadAttachParams, ThreadCreateParams, ThreadLinkParams, ThreadListParams,
+    ThreadResolveParams,
 };
 use crate::state::DaemonState;
-
-const INLINE_CONTEXT_MAX_BYTES: usize = 16_384;
-const CURSOR_MARKER: &str = "<HARNESSD_CURSOR>";
 
 /// Start the IPC server and listen for JSON-RPC connections.
 pub async fn serve(
@@ -172,6 +170,8 @@ async fn process_request(
         "anchors" => handle_anchors(request, state).await,
         "generate" => handle_generate(request, state).await,
         "inline" => handle_inline(request, state).await,
+        "inline.fast" => handle_inline_fast(request, state).await,
+        "inline.prepare" => handle_inline_prepare(request, state).await,
         "scratch.create" => handle_scratch_create(request, state).await,
         "codex.sessions" => handle_codex_sessions(request).await,
         "thread.create" => handle_thread_create(request, state).await,
@@ -385,7 +385,7 @@ async fn handle_inline(request: JsonRpcRequest, state: &Arc<DaemonState>) -> Jso
             return JsonRpcResponse::error(request.id, -32602, "Missing params".to_string(), None);
         }
     };
-    match inline(state, &params).await {
+    match crate::autocomplete::inline(state, &params).await {
         Ok(suggestion) => {
             JsonRpcResponse::success(request.id, serde_json::json!({ "suggestion": suggestion }))
         }
@@ -393,6 +393,41 @@ async fn handle_inline(request: JsonRpcRequest, state: &Arc<DaemonState>) -> Jso
             request.id,
             -32001,
             format!("Inline generation failed: {e}"),
+            Some(serde_json::json!({ "retryable": true })),
+        ),
+    }
+}
+
+async fn handle_inline_fast(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcResponse {
+    let params: InlineFastParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return *response,
+    };
+    match crate::autocomplete::inline_fast(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => JsonRpcResponse::error(
+            request.id,
+            -32001,
+            format!("Fast inline failed: {e}"),
+            Some(serde_json::json!({ "retryable": true })),
+        ),
+    }
+}
+
+async fn handle_inline_prepare(
+    request: JsonRpcRequest,
+    state: &Arc<DaemonState>,
+) -> JsonRpcResponse {
+    let params: InlinePrepareParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return *response,
+    };
+    match crate::autocomplete::inline_prepare(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => JsonRpcResponse::error(
+            request.id,
+            -32001,
+            format!("Inline prepare failed: {e}"),
             Some(serde_json::json!({ "retryable": true })),
         ),
     }
@@ -494,57 +529,82 @@ pub async fn complete(
         .await
         .with_context(|| format!("failed to read {}", params.file))?;
 
-    let mut parser = state.parser.write().await;
-    let parsed = parser.parse_file(Path::new(&params.file), &content)?;
+    let lookup = complete_from_content(
+        state,
+        &params.file,
+        &content,
+        params.offset,
+        params.prefix.as_deref(),
+    )
+    .await?;
+    Ok(lookup.suggestions)
+}
 
-    let Some(node) = parsed.node_at_offset(params.offset) else {
-        return Ok(vec![]);
+pub(crate) struct CompleteLookup {
+    pub(crate) suggestions: Vec<CompletionSuggestion>,
+    pub(crate) source: &'static str,
+}
+
+pub(crate) async fn complete_from_content(
+    state: &Arc<DaemonState>,
+    file: &str,
+    content: &str,
+    offset: usize,
+    prefix: Option<&str>,
+) -> anyhow::Result<CompleteLookup> {
+    let mut parser = state.parser.write().await;
+    let parsed = parser.parse_file(Path::new(file), content)?;
+
+    let Some(node) = parsed.node_at_offset(offset) else {
+        return Ok(CompleteLookup {
+            suggestions: vec![],
+            source: "none",
+        });
     };
 
-    let content_hash = crate::parser::hash_node_region(&content, node);
+    let content_hash = crate::parser::hash_node_region(content, node);
     let proposals = state
         .cache
-        .lookup(
-            &params.file,
-            node.start_byte(),
-            node.end_byte(),
-            &content_hash,
-        )
+        .lookup(file, node.start_byte(), node.end_byte(), &content_hash)
         .await
         .unwrap_or_default();
 
     let mut suggestions = proposals_to_suggestions(proposals, "cached");
+    apply_prefix_filter(&mut suggestions, prefix);
     if !suggestions.is_empty() {
-        apply_prefix_filter(&mut suggestions, params.prefix.as_deref());
-        return Ok(suggestions);
+        return Ok(CompleteLookup {
+            suggestions,
+            source: "cache",
+        });
     }
 
-    if suggestions.is_empty() {
-        for region in regions_for_anchors(&parsed, &params.file)
-            .into_iter()
-            .filter(|region| {
-                params.offset >= region.context_start && params.offset <= region.context_end
-            })
-        {
-            let proposals = state
-                .cache
-                .lookup(&params.file, region.start, region.end, &region.content_hash)
-                .await
-                .unwrap_or_default();
-            suggestions.extend(proposals_to_suggestions(proposals, "cached (anchor)"));
-        }
+    for region in regions_for_anchors(&parsed, file)
+        .into_iter()
+        .filter(|region| offset >= region.context_start && offset <= region.context_end)
+    {
+        let proposals = state
+            .cache
+            .lookup(file, region.start, region.end, &region.content_hash)
+            .await
+            .unwrap_or_default();
+        suggestions.extend(proposals_to_suggestions(proposals, "cached (anchor)"));
+    }
+    apply_prefix_filter(&mut suggestions, prefix);
+    if !suggestions.is_empty() {
+        return Ok(CompleteLookup {
+            suggestions,
+            source: "anchor-cache",
+        });
     }
 
     // Preserve entries created by older function-scoped cache behavior as a fallback only.
-    if suggestions.is_empty()
-        && let Some(function) = parsed.enclosing_function(params.offset)
-    {
+    if let Some(function) = parsed.enclosing_function(offset) {
         let function_text = parsed.node_text(function);
         let function_hash = crate::cache::compute_hash(function_text);
         let function_proposals = state
             .cache
             .lookup(
-                &params.file,
+                file,
                 function.start_byte(),
                 function.end_byte(),
                 &function_hash,
@@ -554,8 +614,16 @@ pub async fn complete(
         suggestions = proposals_to_suggestions(function_proposals, "cached (function)");
     }
 
-    apply_prefix_filter(&mut suggestions, params.prefix.as_deref());
-    Ok(suggestions)
+    apply_prefix_filter(&mut suggestions, prefix);
+    let source = if suggestions.is_empty() {
+        "none"
+    } else {
+        "function-cache"
+    };
+    Ok(CompleteLookup {
+        suggestions,
+        source,
+    })
 }
 
 /// Inspect the anchors in one saved file without triggering generation.
@@ -654,40 +722,6 @@ pub async fn generate(
         label: label_for_anchor(region.anchor.kind).to_string(),
         insert_text: snippet,
         detail: Some("generated through ACP".to_string()),
-        documentation: None,
-    })
-}
-
-/// Generate an ephemeral bounded proposal at a live-buffer cursor location.
-pub async fn inline(
-    state: &Arc<DaemonState>,
-    params: &InlineParams,
-) -> anyhow::Result<CompletionSuggestion> {
-    if params.prompt.trim().is_empty() {
-        anyhow::bail!("inline prompt must not be empty");
-    }
-    if params.offset > params.content.len() {
-        anyhow::bail!("cursor offset is outside buffer content");
-    }
-    if !params.content.is_char_boundary(params.offset) {
-        anyhow::bail!("cursor offset is not a UTF-8 character boundary");
-    }
-
-    let mut parser = state.parser.write().await;
-    let parsed = parser.parse_file(Path::new(&params.file), &params.content)?;
-    drop(parser);
-    let cursor_context = inline_cursor_context(&parsed, params.offset);
-    let context = InlineContext {
-        file: Path::new(&params.file),
-        language: language_name(parsed.language),
-        prompt: params.prompt.trim(),
-        cursor_context: &cursor_context,
-    };
-    let snippet = state.acp.generate_inline(&context).await?;
-    Ok(CompletionSuggestion {
-        label: "Inline ask".to_string(),
-        insert_text: snippet,
-        detail: Some("generated through ACP inline ask".to_string()),
         documentation: None,
     })
 }
@@ -895,7 +929,7 @@ fn kind_name(kind: AnchorKind) -> &'static str {
     }
 }
 
-fn language_name(language: SupportedLanguage) -> &'static str {
+pub(crate) fn language_name(language: SupportedLanguage) -> &'static str {
     match language {
         SupportedLanguage::Rust => "Rust",
         SupportedLanguage::JavaScript => "JavaScript",
@@ -906,18 +940,18 @@ fn language_name(language: SupportedLanguage) -> &'static str {
     }
 }
 
-struct AnchorRegion {
+pub(crate) struct AnchorRegion {
     anchor: Anchor,
-    start: usize,
-    end: usize,
-    context_start: usize,
-    context_end: usize,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) context_start: usize,
+    pub(crate) context_end: usize,
     content_hash: String,
-    text: String,
+    pub(crate) text: String,
     key: String,
 }
 
-fn regions_for_anchors(parsed: &ParsedFile, file: &str) -> Vec<AnchorRegion> {
+pub(crate) fn regions_for_anchors(parsed: &ParsedFile, file: &str) -> Vec<AnchorRegion> {
     parsed
         .find_anchors()
         .into_iter()
@@ -952,45 +986,6 @@ fn regions_for_anchors(parsed: &ParsedFile, file: &str) -> Vec<AnchorRegion> {
             }
         })
         .collect()
-}
-
-fn inline_cursor_context(parsed: &ParsedFile, offset: usize) -> String {
-    if let Some(function) = parsed.enclosing_function(offset) {
-        let text = parsed.node_text(function);
-        if text.len() <= INLINE_CONTEXT_MAX_BYTES {
-            let relative_offset = offset.saturating_sub(function.start_byte());
-            return insert_cursor_marker(text, relative_offset);
-        }
-    }
-
-    let source = parsed.source.as_str();
-    let half = INLINE_CONTEXT_MAX_BYTES / 2;
-    let mut start = offset.saturating_sub(half);
-    let mut end = (start + INLINE_CONTEXT_MAX_BYTES).min(source.len());
-    start = previous_char_boundary(source, start);
-    end = previous_char_boundary(source, end);
-    if end < offset {
-        end = offset;
-    }
-    if end - start < INLINE_CONTEXT_MAX_BYTES && end == source.len() {
-        start = previous_char_boundary(source, end.saturating_sub(INLINE_CONTEXT_MAX_BYTES));
-    }
-    insert_cursor_marker(&source[start..end], offset - start)
-}
-
-fn insert_cursor_marker(text: &str, offset: usize) -> String {
-    let mut context = String::with_capacity(text.len() + CURSOR_MARKER.len());
-    context.push_str(&text[..offset]);
-    context.push_str(CURSOR_MARKER);
-    context.push_str(&text[offset..]);
-    context
-}
-
-fn previous_char_boundary(text: &str, mut offset: usize) -> usize {
-    while offset > 0 && !text.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    offset
 }
 
 fn snippet_for_anchor(

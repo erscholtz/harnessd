@@ -2,6 +2,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -11,10 +12,10 @@ use crate::cli::{Commands, ThreadCommands};
 use crate::daemon_lock::{DaemonLock, read_daemon_pid};
 use crate::paths;
 use crate::rpc::{
-    AnchorsParams, CodexSessionsParams, CompleteParams, GenerateParams, InlineParams,
-    JsonRpcRequest, PrefetchParams, PrefetchResult, ScratchCreateParams, StatusResult,
-    ThreadAttachParams, ThreadCreateParams, ThreadLinkParams, ThreadListParams,
-    ThreadResolveParams,
+    AnchorsParams, CodexSessionsParams, CompleteParams, GenerateParams, InlineFastParams,
+    InlineParams, InlinePrepareParams, JsonRpcRequest, PrefetchParams, PrefetchResult,
+    ScratchCreateParams, StatusResult, ThreadAttachParams, ThreadCreateParams, ThreadLinkParams,
+    ThreadListParams, ThreadResolveParams,
 };
 use crate::runtime;
 
@@ -37,7 +38,18 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
             file,
             offset,
             prompt,
-        } => run_inline(&file, offset, &prompt).await,
+            model,
+            reasoning_effort,
+        } => {
+            run_inline(
+                &file,
+                offset,
+                &prompt,
+                model.as_deref(),
+                reasoning_effort.as_deref(),
+            )
+            .await
+        }
         Commands::Scratch {
             workspace,
             file,
@@ -45,6 +57,8 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
             prompt,
             selection_start,
             selection_end,
+            model,
+            reasoning_effort,
         } => {
             run_scratch(
                 &workspace,
@@ -53,6 +67,8 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
                 &prompt,
                 selection_start,
                 selection_end,
+                model.as_deref(),
+                reasoning_effort.as_deref(),
             )
             .await
         }
@@ -70,6 +86,9 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
             line,
             text,
             cursor,
+            model,
+            reasoning_effort,
+            no_background_refresh,
         } => {
             run_bridge(
                 &method,
@@ -77,6 +96,9 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
                 line,
                 text.as_deref(),
                 cursor.as_deref(),
+                model.as_deref(),
+                reasoning_effort.as_deref(),
+                !no_background_refresh,
             )
             .await
         }
@@ -120,26 +142,37 @@ async fn run_daemon() -> anyhow::Result<()> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
     let shutdown_tx_clone = shutdown_tx.clone();
+    let shutdown_tx_cleanup = shutdown_tx.clone();
 
-    let shutdown_handle = tokio::spawn(async move {
+    let mut shutdown_handle = tokio::spawn(async move {
         crate::shutdown::wait_for_shutdown().await;
         let _ = shutdown_tx_clone.send(()).await;
     });
 
-    let ipc_handle = tokio::spawn(async move {
-        if let Err(e) = crate::ipc::serve(state, shutdown_tx, shutdown_rx).await {
+    let ipc_state = Arc::clone(&state);
+    let mut ipc_handle = tokio::spawn(async move {
+        if let Err(e) = crate::ipc::serve(ipc_state, shutdown_tx, shutdown_rx).await {
             tracing::error!(error = %e, "IPC server error");
         }
     });
 
     tokio::select! {
-        _ = shutdown_handle => {
+        _ = &mut shutdown_handle => {
             tracing::info!("shutdown signal received");
         }
-        _ = ipc_handle => {
+        _ = &mut ipc_handle => {
             tracing::info!("IPC server exited");
         }
     }
+
+    let _ = shutdown_tx_cleanup.send(()).await;
+    if !ipc_handle.is_finished() {
+        let _ = ipc_handle.await;
+    }
+    if !shutdown_handle.is_finished() {
+        shutdown_handle.abort();
+    }
+    state.acp.shutdown().await;
 
     tracing::info!("daemon shutting down cleanly");
     Ok(())
@@ -287,12 +320,18 @@ async fn run_complete(file: &Path, offset: usize, prefix: Option<&str>) -> anyho
     Ok(())
 }
 
-async fn run_inline(file: &Path, offset: usize, prompt: &str) -> anyhow::Result<()> {
+async fn run_inline(
+    file: &Path,
+    offset: usize,
+    prompt: &str,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+) -> anyhow::Result<()> {
     let content = read_stdin_optional().await?;
     if content.is_empty() {
         anyhow::bail!("`inline` requires live buffer contents on stdin");
     }
-    let request = build_inline_request(file, offset, prompt, content)?;
+    let request = build_inline_request(file, offset, prompt, content, model, reasoning_effort)?;
     println!("{}", send_rpc_request(&request).await?);
     Ok(())
 }
@@ -316,6 +355,8 @@ async fn run_scratch(
     prompt: &str,
     selection_start: Option<usize>,
     selection_end: Option<usize>,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
 ) -> anyhow::Result<()> {
     let content = read_stdin_optional().await?;
     if content.is_empty() {
@@ -329,6 +370,8 @@ async fn run_scratch(
         content,
         selection_start,
         selection_end,
+        model,
+        reasoning_effort,
     )?;
     println!("{}", send_rpc_request(&request).await?);
     Ok(())
@@ -339,6 +382,8 @@ fn build_inline_request(
     offset: usize,
     prompt: &str,
     content: String,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
 ) -> anyhow::Result<JsonRpcRequest> {
     if prompt.trim().is_empty() {
         anyhow::bail!("`--prompt` must not be empty for `inline`");
@@ -353,6 +398,10 @@ fn build_inline_request(
             offset,
             content,
             prompt: prompt.to_string(),
+            model: crate::models::normalize_model(model.map(str::to_string))?,
+            reasoning_effort: crate::models::normalize_reasoning_effort(
+                reasoning_effort.map(str::to_string),
+            )?,
         }),
     )
 }
@@ -365,6 +414,8 @@ fn build_scratch_request(
     content: String,
     selection_start: Option<usize>,
     selection_end: Option<usize>,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
 ) -> anyhow::Result<JsonRpcRequest> {
     if prompt.trim().is_empty() {
         anyhow::bail!("`--prompt` must not be empty for `scratch`");
@@ -382,6 +433,10 @@ fn build_scratch_request(
             prompt: prompt.to_string(),
             selection_start,
             selection_end,
+            model: crate::models::normalize_model(model.map(str::to_string))?,
+            reasoning_effort: crate::models::normalize_reasoning_effort(
+                reasoning_effort.map(str::to_string),
+            )?,
         }),
     )
 }
@@ -419,6 +474,8 @@ async fn run_thread(command: ThreadCommands) -> anyhow::Result<()> {
             prompt,
             selection_start,
             selection_end,
+            model,
+            reasoning_effort,
         } => {
             let content = read_stdin_optional().await?;
             if content.is_empty() {
@@ -434,6 +491,8 @@ async fn run_thread(command: ThreadCommands) -> anyhow::Result<()> {
                     prompt,
                     selection_start,
                     selection_end,
+                    model: crate::models::normalize_model(model)?,
+                    reasoning_effort: crate::models::normalize_reasoning_effort(reasoning_effort)?,
                 }),
             )?;
             println!("{}", send_rpc_request(&request).await?);
@@ -512,8 +571,28 @@ async fn run_bridge(
     line: Option<u32>,
     text: Option<&str>,
     cursor: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    allow_background_refresh: bool,
 ) -> anyhow::Result<()> {
-    let request = build_bridge_request(method, file, line, text, cursor)?;
+    let stdin = if method == "inline.fast" {
+        let mut content = String::new();
+        tokio::io::stdin().read_to_string(&mut content).await?;
+        Some(content)
+    } else {
+        None
+    };
+    let request = build_bridge_request(
+        method,
+        file,
+        line,
+        text,
+        cursor,
+        model,
+        reasoning_effort,
+        allow_background_refresh,
+        stdin.as_deref(),
+    )?;
     println!("{}", send_rpc_request(&request).await?);
     Ok(())
 }
@@ -522,8 +601,12 @@ fn build_bridge_request(
     method: &str,
     file: Option<&Path>,
     line: Option<u32>,
-    _text: Option<&str>,
+    text: Option<&str>,
     cursor: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+    allow_background_refresh: bool,
+    stdin: Option<&str>,
 ) -> anyhow::Result<JsonRpcRequest> {
     match method {
         "complete" => {
@@ -571,6 +654,42 @@ fn build_bridge_request(
                 Some(GenerateParams {
                     file: canonicalize_rpc_path(file)?,
                     offset,
+                }),
+            )
+        }
+        "inline.prepare" => {
+            let file = file.context("`--file` is required for `bridge --method inline.prepare`")?;
+            rpc_request(
+                method,
+                Some(InlinePrepareParams {
+                    file: canonicalize_rpc_path(file)?,
+                    model: crate::models::normalize_model(model.map(str::to_string))?,
+                    reasoning_effort: crate::models::normalize_reasoning_effort(
+                        reasoning_effort.map(str::to_string),
+                    )?,
+                }),
+            )
+        }
+        "inline.fast" => {
+            let file = file.context("`--file` is required for `bridge --method inline.fast`")?;
+            let offset = cursor
+                .context("`--cursor` is required for `bridge --method inline.fast`")?
+                .parse::<usize>()
+                .context("`--cursor` must be a byte offset for `inline.fast`")?;
+            let content = stdin.context("`inline.fast` requires live buffer contents on stdin")?;
+            rpc_request(
+                method,
+                Some(InlineFastParams {
+                    file: canonicalize_rpc_path(file)?,
+                    offset,
+                    content: content.to_string(),
+                    prefix: None,
+                    prompt: text.map(str::to_string),
+                    model: crate::models::normalize_model(model.map(str::to_string))?,
+                    reasoning_effort: crate::models::normalize_reasoning_effort(
+                        reasoning_effort.map(str::to_string),
+                    )?,
+                    allow_background_refresh,
                 }),
             )
         }
@@ -863,7 +982,8 @@ fn canonicalize_rpc_path(path: &Path) -> anyhow::Result<String> {
 mod tests {
     use super::{build_bridge_request, build_inline_request, build_scratch_request};
     use crate::rpc::{
-        CompleteParams, GenerateParams, InlineParams, PrefetchParams, ScratchCreateParams,
+        CompleteParams, GenerateParams, InlineFastParams, InlineParams, InlinePrepareParams,
+        PrefetchParams, ScratchCreateParams,
     };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -885,8 +1005,18 @@ mod tests {
     #[test]
     fn bridge_builds_complete_request() {
         let file = temp_file_path("fixture.rs");
-        let request = build_bridge_request("complete", Some(&file), None, None, Some("7"))
-            .expect("failed to build complete request");
+        let request = build_bridge_request(
+            "complete",
+            Some(&file),
+            None,
+            None,
+            Some("7"),
+            None,
+            None,
+            true,
+            None,
+        )
+        .expect("failed to build complete request");
 
         assert_eq!(request.method, "complete");
         let params: CompleteParams =
@@ -908,8 +1038,18 @@ mod tests {
     #[test]
     fn bridge_builds_prefetch_request() {
         let file = temp_file_path("fixture.rs");
-        let request = build_bridge_request("prefetch", Some(&file), None, None, None)
-            .expect("failed to build prefetch request");
+        let request = build_bridge_request(
+            "prefetch",
+            Some(&file),
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            None,
+        )
+        .expect("failed to build prefetch request");
 
         assert_eq!(request.method, "prefetch");
         let params: PrefetchParams =
@@ -927,10 +1067,90 @@ mod tests {
     }
 
     #[test]
+    fn bridge_builds_inline_prepare_request() {
+        let file = temp_file_path("fixture.rs");
+        let request = build_bridge_request(
+            "inline.prepare",
+            Some(&file),
+            None,
+            None,
+            None,
+            Some("gpt-5.4-mini"),
+            Some("low"),
+            true,
+            None,
+        )
+        .expect("failed to build inline prepare request");
+
+        assert_eq!(request.method, "inline.prepare");
+        let params: InlinePrepareParams =
+            serde_json::from_value(request.params.expect("missing params")).expect("bad params");
+        assert_eq!(
+            params.file,
+            file.canonicalize()
+                .expect("canonicalize failed")
+                .to_string_lossy()
+                .to_string()
+        );
+        assert_eq!(params.model.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(params.reasoning_effort.as_deref(), Some("low"));
+
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();
+    }
+
+    #[test]
+    fn bridge_builds_inline_fast_request_from_stdin() {
+        let file = temp_file_path("fixture.rs");
+        let request = build_bridge_request(
+            "inline.fast",
+            Some(&file),
+            None,
+            Some("complete the line"),
+            Some("7"),
+            Some("gpt-5.4-mini"),
+            Some("low"),
+            true,
+            Some("fn demo() {}\n"),
+        )
+        .expect("failed to build inline.fast request");
+
+        assert_eq!(request.method, "inline.fast");
+        let params: InlineFastParams =
+            serde_json::from_value(request.params.expect("missing params")).expect("bad params");
+        assert_eq!(
+            params.file,
+            file.canonicalize()
+                .expect("canonicalize failed")
+                .to_string_lossy()
+                .to_string()
+        );
+        assert_eq!(params.offset, 7);
+        assert_eq!(params.content, "fn demo() {}\n");
+        assert_eq!(params.prompt.as_deref(), Some("complete the line"));
+        assert!(params.allow_background_refresh);
+        assert_eq!(params.model.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(params.reasoning_effort.as_deref(), Some("low"));
+
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();
+    }
+
+    #[test]
     fn bridge_builds_generate_request() {
         let file = temp_file_path("fixture.rs");
-        let request = build_bridge_request("generate", Some(&file), None, None, Some("7"))
-            .expect("failed to build generate request");
+        let request = build_bridge_request(
+            "generate",
+            Some(&file),
+            None,
+            None,
+            Some("7"),
+            None,
+            None,
+            true,
+            None,
+        )
+        .expect("failed to build generate request");
 
         assert_eq!(request.method, "generate");
         let params: GenerateParams =
@@ -944,8 +1164,18 @@ mod tests {
     #[test]
     fn bridge_complete_requires_cursor() {
         let file = temp_file_path("fixture.rs");
-        let error = build_bridge_request("complete", Some(&file), None, None, None)
-            .expect_err("expected missing cursor to fail");
+        let error = build_bridge_request(
+            "complete",
+            Some(&file),
+            None,
+            None,
+            None,
+            None,
+            None,
+            true,
+            None,
+        )
+        .expect_err("expected missing cursor to fail");
 
         assert!(
             error
@@ -960,14 +1190,23 @@ mod tests {
     #[test]
     fn inline_builds_request_from_live_buffer_content() {
         let file = temp_file_path("fixture.rs");
-        let request = build_inline_request(&file, 7, "insert a value", "fn unsaved() {}".into())
-            .expect("failed to build inline request");
+        let request = build_inline_request(
+            &file,
+            7,
+            "insert a value",
+            "fn unsaved() {}".into(),
+            Some("gpt-5.4-mini"),
+            Some("low"),
+        )
+        .expect("failed to build inline request");
         assert_eq!(request.method, "inline");
         let params: InlineParams =
             serde_json::from_value(request.params.expect("missing params")).expect("bad params");
         assert_eq!(params.offset, 7);
         assert_eq!(params.prompt, "insert a value");
         assert_eq!(params.content, "fn unsaved() {}");
+        assert_eq!(params.model.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(params.reasoning_effort.as_deref(), Some("low"));
 
         std::fs::remove_file(&file).ok();
         std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();
@@ -976,8 +1215,8 @@ mod tests {
     #[test]
     fn inline_rejects_empty_content_and_prompt() {
         let file = temp_file_path("fixture.rs");
-        assert!(build_inline_request(&file, 0, "ask", String::new()).is_err());
-        assert!(build_inline_request(&file, 0, " ", "fn x() {}".into()).is_err());
+        assert!(build_inline_request(&file, 0, "ask", String::new(), None, None).is_err());
+        assert!(build_inline_request(&file, 0, " ", "fn x() {}".into(), None, None).is_err());
 
         std::fs::remove_file(&file).ok();
         std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();
@@ -995,6 +1234,8 @@ mod tests {
             "fn unsaved() {}".into(),
             Some(1),
             Some(5),
+            Some("gpt-5.4-mini"),
+            Some("low"),
         )
         .expect("failed to build scratch request");
         assert_eq!(request.method, "scratch.create");
@@ -1005,6 +1246,8 @@ mod tests {
         assert_eq!(params.content, "fn unsaved() {}");
         assert_eq!(params.selection_start, Some(1));
         assert_eq!(params.selection_end, Some(5));
+        assert_eq!(params.model.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(params.reasoning_effort.as_deref(), Some("low"));
 
         std::fs::remove_file(&file).ok();
         std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();
@@ -1015,11 +1258,32 @@ mod tests {
         let file = temp_file_path("fixture.rs");
         let workspace = file.parent().unwrap().to_path_buf();
         assert!(
-            build_scratch_request(&workspace, &file, 0, "ask", String::new(), None, None).is_err()
+            build_scratch_request(
+                &workspace,
+                &file,
+                0,
+                "ask",
+                String::new(),
+                None,
+                None,
+                None,
+                None
+            )
+            .is_err()
         );
         assert!(
-            build_scratch_request(&workspace, &file, 0, " ", "fn x() {}".into(), None, None)
-                .is_err()
+            build_scratch_request(
+                &workspace,
+                &file,
+                0,
+                " ",
+                "fn x() {}".into(),
+                None,
+                None,
+                None,
+                None
+            )
+            .is_err()
         );
 
         std::fs::remove_file(&file).ok();

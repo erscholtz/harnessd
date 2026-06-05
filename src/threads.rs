@@ -30,6 +30,12 @@ pub struct ThreadCreateParams {
     /// Optional selected end byte.
     #[serde(default)]
     pub selection_end: Option<usize>,
+    /// Optional model override for the launched Codex thread.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional reasoning effort override for the launched Codex thread.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Parameters for listing anchored threads.
@@ -106,6 +112,12 @@ pub struct ThreadAnchor {
     pub prompt_preview: String,
     /// Full user prompt used for thread creation.
     pub prompt: String,
+    /// Optional model override used when the thread was created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Optional reasoning effort override used when the thread was created.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// Optional Codex session id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex_session_id: Option<String>,
@@ -129,6 +141,12 @@ pub struct ThreadLaunch {
     pub cwd: String,
     /// Unix timestamp immediately before launch planning.
     pub started_after_unix: u64,
+    /// Optional model override used for launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Optional reasoning effort override used for launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Result of creating a thread.
@@ -187,6 +205,9 @@ impl ThreadStore {
         let line_text = line_text_at(&params.content, line).unwrap_or_default();
         let now = unix_timestamp();
         let mut threads = self.load()?;
+        let model = crate::models::normalize_model(params.model.clone())?;
+        let reasoning_effort =
+            crate::models::normalize_reasoning_effort(params.reasoning_effort.clone())?;
         let thread = ThreadAnchor {
             thread_id: new_thread_id(),
             workspace: workspace.display().to_string(),
@@ -198,6 +219,8 @@ impl ThreadStore {
             line_preview: truncate(line_text.trim(), LINE_PREVIEW_MAX_CHARS),
             prompt_preview: truncate(params.prompt.trim(), PROMPT_PREVIEW_MAX_CHARS),
             prompt: params.prompt.trim().to_string(),
+            model,
+            reasoning_effort,
             codex_session_id: None,
             codex_session_path: None,
             status: "open".to_string(),
@@ -277,6 +300,8 @@ impl ThreadStore {
             prompt: format!("Attached Codex session {}", params.codex_session_id),
             selection_start: None,
             selection_end: None,
+            model: None,
+            reasoning_effort: None,
         })?;
         self.link(&ThreadLinkParams {
             thread_id: created.thread.thread_id,
@@ -341,6 +366,14 @@ fn launch_for(
         argv.push("resume".to_string());
         argv.push(session_id.clone());
     } else {
+        if let Some(model) = &thread.model {
+            argv.push("--model".to_string());
+            argv.push(model.clone());
+        }
+        if let Some(effort) = &thread.reasoning_effort {
+            argv.push("-c".to_string());
+            argv.push(crate::models::reasoning_effort_config_arg(effort));
+        }
         argv.push("-C".to_string());
         argv.push(thread.workspace.clone());
     }
@@ -354,6 +387,8 @@ fn launch_for(
         argv,
         cwd: thread.workspace.clone(),
         started_after_unix: unix_timestamp(),
+        model: thread.model.clone(),
+        reasoning_effort: thread.reasoning_effort.clone(),
     }
 }
 
@@ -542,6 +577,8 @@ mod tests {
                 prompt: "fix target".to_string(),
                 selection_start: None,
                 selection_end: None,
+                model: None,
+                reasoning_effort: None,
             })
             .unwrap();
         assert_eq!(created.thread.current_line, 2);
@@ -580,6 +617,8 @@ mod tests {
                 prompt: "ask".to_string(),
                 selection_start: None,
                 selection_end: None,
+                model: None,
+                reasoning_effort: None,
             })
             .unwrap();
         let listed = store

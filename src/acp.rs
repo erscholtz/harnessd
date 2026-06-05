@@ -1,17 +1,22 @@
 //! Minimal stdio ACP client used for explicit inline generation requests.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
 
 use crate::cache::{MAX_BYTES, MAX_LINES};
 
 const DEFAULT_GENERATION_TIMEOUT: Duration = Duration::from_secs(120);
+const ANCHOR_REASONING_EFFORT: &str = "high";
+const INLINE_REASONING_EFFORT: &str = "low";
 
 /// Input context supplied to one ACP generation turn.
 pub struct GenerationContext<'a> {
@@ -44,6 +49,7 @@ pub struct InlineContext<'a> {
 pub struct AcpClient {
     program: PathBuf,
     timeout: Duration,
+    reusable_sessions: Arc<Mutex<HashMap<ReusableSessionKey, ReusableSession>>>,
 }
 
 impl AcpClient {
@@ -54,6 +60,7 @@ impl AcpClient {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("codex-acp")),
             timeout: DEFAULT_GENERATION_TIMEOUT,
+            reusable_sessions: Arc::default(),
         }
     }
 
@@ -62,6 +69,7 @@ impl AcpClient {
         Self {
             program: program.into(),
             timeout: DEFAULT_GENERATION_TIMEOUT,
+            reusable_sessions: Arc::default(),
         }
     }
 
@@ -70,30 +78,75 @@ impl AcpClient {
         Self {
             program: program.into(),
             timeout,
+            reusable_sessions: Arc::default(),
         }
     }
 
     /// Run one isolated prompt turn and return bounded insertion-only text.
     pub async fn generate(&self, context: &GenerationContext<'_>) -> anyhow::Result<String> {
-        self.generate_with_prompt(context.file, generation_prompt(context))
-            .await
+        self.generate_with_prompt(
+            context.file,
+            generation_prompt(context),
+            ANCHOR_REASONING_EFFORT,
+        )
+        .await
     }
 
     /// Run one freeform insertion request and return bounded insertion-only text.
-    pub async fn generate_inline(&self, context: &InlineContext<'_>) -> anyhow::Result<String> {
-        self.generate_with_prompt(context.file, inline_prompt(context))
+    pub async fn generate_inline(
+        &self,
+        context: &InlineContext<'_>,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let reasoning_effort = reasoning_effort.unwrap_or(INLINE_REASONING_EFFORT);
+        self.generate_with_reusable_prompt(
+            context.file,
+            inline_prompt(context),
+            reasoning_effort,
+            model,
+        )
+        .await
+    }
+
+    /// Start the reusable inline ACP session for this file's workspace before a prompt arrives.
+    pub async fn prepare_inline(
+        &self,
+        file: &Path,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let reasoning_effort = reasoning_effort.unwrap_or(INLINE_REASONING_EFFORT);
+        self.prepare_reusable_session(file, reasoning_effort, model)
             .await
     }
 
-    async fn generate_with_prompt(&self, file: &Path, prompt: String) -> anyhow::Result<String> {
+    /// Terminate reusable ACP sessions owned by this client.
+    pub async fn shutdown(&self) {
+        let mut sessions = self.reusable_sessions.lock().await;
+        for (_, mut session) in sessions.drain() {
+            session.terminate().await;
+        }
+    }
+
+    async fn generate_with_prompt(
+        &self,
+        file: &Path,
+        prompt: String,
+        reasoning_effort: &str,
+    ) -> anyhow::Result<String> {
         let cwd = file
             .parent()
             .context("source file has no parent directory for ACP session")?;
-        let mut child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
+            .arg("-c")
+            .arg(reasoning_config_arg(reasoning_effort))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        let mut child = command
             .spawn()
             .with_context(|| format!("failed to launch {}", self.program.display()))?;
         let mut stdin = child
@@ -123,6 +176,275 @@ impl AcpClient {
         terminate_child(&mut child).await;
         result.and_then(normalize_output)
     }
+
+    async fn generate_with_reusable_prompt(
+        &self,
+        file: &Path,
+        prompt: String,
+        reasoning_effort: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let cwd = file
+            .parent()
+            .context("source file has no parent directory for ACP session")?;
+        let model = crate::models::normalize_model(model.map(str::to_string))?;
+        let key = ReusableSessionKey::new(cwd, reasoning_effort, model.as_deref());
+        let mut sessions = self.reusable_sessions.lock().await;
+        let result = match tokio::time::timeout(
+            self.timeout,
+            run_reusable_turn(
+                &mut sessions,
+                &self.program,
+                cwd,
+                reasoning_effort,
+                model.as_deref(),
+                &prompt,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "ACP generation timed out after {:?}",
+                self.timeout
+            )),
+        };
+
+        if result.is_err() {
+            if let Some(mut session) = sessions.remove(&key) {
+                session.terminate().await;
+            }
+        } else if let Some(session) = sessions.get_mut(&key)
+            && session.exited()
+        {
+            sessions.remove(&key);
+        }
+
+        result.and_then(normalize_output)
+    }
+
+    async fn prepare_reusable_session(
+        &self,
+        file: &Path,
+        reasoning_effort: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let cwd = file
+            .parent()
+            .context("source file has no parent directory for ACP session")?;
+        let model = crate::models::normalize_model(model.map(str::to_string))?;
+        let key = ReusableSessionKey::new(cwd, reasoning_effort, model.as_deref());
+        let mut sessions = self.reusable_sessions.lock().await;
+        let result = match tokio::time::timeout(
+            self.timeout,
+            ensure_reusable_session(
+                &mut sessions,
+                &self.program,
+                cwd,
+                reasoning_effort,
+                model.as_deref(),
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "ACP generation timed out after {:?}",
+                self.timeout
+            )),
+        };
+
+        if result.is_err() {
+            if let Some(mut session) = sessions.remove(&key) {
+                session.terminate().await;
+            }
+        }
+        result.map(|_| ())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReusableSessionKey {
+    cwd: PathBuf,
+    reasoning_effort: String,
+    model: Option<String>,
+}
+
+impl ReusableSessionKey {
+    fn new(cwd: &Path, reasoning_effort: &str, model: Option<&str>) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            reasoning_effort: reasoning_effort.to_string(),
+            model: model.map(str::to_string),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ReusableSession {
+    child: Child,
+    stdin: ChildStdin,
+    reader: BufReader<ChildStdout>,
+    session_id: String,
+    next_id: u64,
+}
+
+impl ReusableSession {
+    async fn start(
+        program: &Path,
+        cwd: &Path,
+        reasoning_effort: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let mut command = Command::new(program);
+        command
+            .arg("-c")
+            .arg(reasoning_config_arg(reasoning_effort));
+        if let Some(model) = model {
+            command
+                .arg("-c")
+                .arg(crate::models::model_config_arg(model));
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("failed to launch {}", program.display()))?;
+        let setup = async {
+            let mut stdin = child
+                .stdin
+                .take()
+                .context("ACP child stdin is unavailable")?;
+            let stdout = child
+                .stdout
+                .take()
+                .context("ACP child stdout is unavailable")?;
+            let mut reader = BufReader::new(stdout);
+
+            send_request(
+                &mut stdin,
+                0,
+                "initialize",
+                json!({
+                    "protocolVersion": 1,
+                    "clientCapabilities": {},
+                    "clientInfo": {
+                        "name": "harnessd",
+                        "title": "harnessd inline completion",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }),
+            )
+            .await?;
+            wait_for_response(&mut stdin, &mut reader, 0, None).await?;
+
+            send_request(
+                &mut stdin,
+                1,
+                "session/new",
+                json!({
+                    "cwd": cwd.to_string_lossy(),
+                    "mcpServers": []
+                }),
+            )
+            .await?;
+            let session = wait_for_response(&mut stdin, &mut reader, 1, None).await?;
+            let session_id = session
+                .pointer("/result/sessionId")
+                .and_then(Value::as_str)
+                .context("ACP session/new response omitted sessionId")?
+                .to_string();
+
+            Ok::<_, anyhow::Error>((stdin, reader, session_id))
+        }
+        .await;
+
+        let (stdin, reader, session_id) = match setup {
+            Ok(session) => session,
+            Err(error) => {
+                terminate_child(&mut child).await;
+                return Err(error);
+            }
+        };
+
+        Ok(Self {
+            child,
+            stdin,
+            reader,
+            session_id,
+            next_id: 2,
+        })
+    }
+
+    async fn prompt(&mut self, prompt: &str) -> anyhow::Result<String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        send_request(
+            &mut self.stdin,
+            id,
+            "session/prompt",
+            json!({
+                "sessionId": self.session_id,
+                "prompt": [{
+                    "type": "text",
+                    "text": prompt
+                }]
+            }),
+        )
+        .await?;
+
+        let mut output = String::new();
+        wait_for_response(&mut self.stdin, &mut self.reader, id, Some(&mut output)).await?;
+        Ok(output)
+    }
+
+    fn exited(&mut self) -> bool {
+        self.child.try_wait().ok().flatten().is_some()
+    }
+
+    async fn terminate(&mut self) {
+        terminate_child(&mut self.child).await;
+    }
+}
+
+async fn run_reusable_turn(
+    sessions: &mut HashMap<ReusableSessionKey, ReusableSession>,
+    program: &Path,
+    cwd: &Path,
+    reasoning_effort: &str,
+    model: Option<&str>,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let key = ensure_reusable_session(sessions, program, cwd, reasoning_effort, model).await?;
+    sessions
+        .get_mut(&key)
+        .context("reusable ACP session was not created")?
+        .prompt(prompt)
+        .await
+}
+
+async fn ensure_reusable_session(
+    sessions: &mut HashMap<ReusableSessionKey, ReusableSession>,
+    program: &Path,
+    cwd: &Path,
+    reasoning_effort: &str,
+    model: Option<&str>,
+) -> anyhow::Result<ReusableSessionKey> {
+    let key = ReusableSessionKey::new(cwd, reasoning_effort, model);
+    let should_start = match sessions.get_mut(&key) {
+        Some(session) => session.exited(),
+        None => true,
+    };
+    if should_start {
+        sessions.remove(&key);
+        sessions.insert(
+            key.clone(),
+            ReusableSession::start(program, cwd, reasoning_effort, model).await?,
+        );
+    }
+    Ok(key)
 }
 
 async fn run_turn<R>(
@@ -207,11 +529,17 @@ fn inline_prompt(context: &InlineContext<'_>) -> String {
          User request: {prompt}\n\n\
          Bounded source context:\n{source}\n\n\
          Return only text suitable for insertion at the cursor. Do not return markdown fences, \
-         explanations, diffs, or file edits. Do not execute tools or read other files.",
+         explanations, diffs, or file edits. Prefer the smallest valid insertion; for completion \
+         requests, return one line unless correctness requires more. Do not execute tools or read \
+         other files.",
         language = context.language,
         prompt = context.prompt,
         source = context.cursor_context
     )
+}
+
+fn reasoning_config_arg(effort: &str) -> String {
+    crate::models::reasoning_effort_config_arg(effort)
 }
 
 async fn send_request(
@@ -340,7 +668,7 @@ pub fn normalize_output(output: String) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_output;
+    use super::{normalize_output, reasoning_config_arg};
     use crate::cache::{MAX_BYTES, MAX_LINES};
 
     #[test]
@@ -356,5 +684,17 @@ mod tests {
         assert!(normalize_output(" \n".to_string()).is_err());
         assert!(normalize_output("x\n".repeat(MAX_LINES + 1)).is_err());
         assert!(normalize_output("x".repeat(MAX_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn reasoning_effort_is_passed_as_codex_config_override() {
+        assert_eq!(
+            reasoning_config_arg("low"),
+            "model_reasoning_effort=\"low\""
+        );
+        assert_eq!(
+            reasoning_config_arg("high"),
+            "model_reasoning_effort=\"high\""
+        );
     }
 }

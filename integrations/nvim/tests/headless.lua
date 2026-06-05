@@ -10,8 +10,33 @@ vim.api.nvim_win_set_cursor(0, { 2, 4 })
 local requests = {}
 local launches = {}
 local notifications = {}
+local channel_sends = {}
+local mock_prepare_error = nil
+local mock_inline_fast_mode = "suggestion"
+local mock_delay_inline_fast = false
+local pending_inline_fast = nil
+local function has_arg_pair(args, first, second)
+  for index = 1, #args - 1 do
+    if args[index] == first and args[index + 1] == second then
+      return true
+    end
+  end
+  return false
+end
+local function find_request(method, submethod)
+  for index = #requests, 1, -1 do
+    local args = requests[index].args
+    if args[2] == method and (submethod == nil or args[3] == submethod) then
+      return requests[index]
+    end
+  end
+  return nil
+end
 vim.notify = function(message, level)
   notifications[#notifications + 1] = { message = message, level = level }
+end
+vim.api.nvim_chan_send = function(channel, data)
+  channel_sends[#channel_sends + 1] = { channel = channel, data = data }
 end
 vim.system = function(args, opts, callback)
   requests[#requests + 1] = { args = args, opts = opts }
@@ -21,6 +46,36 @@ vim.system = function(args, opts, callback)
     stdout = vim.json.encode({
       result = { suggestion = { insert_text = "let added = true;\nreturn added;" } },
     })
+  elseif method == "bridge" and args[4] == "inline.fast" then
+    if mock_inline_fast_mode == "refresh" then
+      stdout = vim.json.encode({
+        result = { source = "none", refresh_queued = true },
+      })
+    elseif mock_inline_fast_mode == "error" then
+      stdout = vim.json.encode({
+        error = { code = -32001, message = "inline fast unavailable" },
+      })
+    else
+      stdout = vim.json.encode({
+        result = { suggestion = { insert_text = "let added = true;\nreturn added;" }, source = "cache", refresh_queued = false },
+      })
+    end
+    if mock_delay_inline_fast then
+      pending_inline_fast = function()
+        callback({ code = 0, stdout = stdout, stderr = "" })
+      end
+      return
+    end
+  elseif method == "bridge" and args[4] == "inline.prepare" then
+    if mock_prepare_error then
+      stdout = vim.json.encode({
+        error = { code = -32001, message = mock_prepare_error },
+      })
+    else
+      stdout = vim.json.encode({
+        result = { prepared = true },
+      })
+    end
   elseif method == "complete" then
     stdout = vim.json.encode({
       result = { suggestions = { { insert_text = "cached_value" } } },
@@ -56,9 +111,11 @@ vim.system = function(args, opts, callback)
           updated_at = 1,
         },
         launch = {
-          argv = { "codex", "--no-alt-screen", "-C", vim.fn.getcwd(), "open a thread" },
+          argv = { "codex", "--no-alt-screen", "--model", "gpt-5.5", "-c", "model_reasoning_effort=\"high\"", "-C", vim.fn.getcwd(), "open a thread" },
           cwd = vim.fn.getcwd(),
           started_after_unix = 1,
+          model = "gpt-5.5",
+          reasoning_effort = "high",
         },
       },
     })
@@ -113,15 +170,107 @@ h.setup({
   command = "harnessd",
   terminal_launcher = function(argv, opts, bufnr)
     launches[#launches + 1] = { argv = argv, opts = opts, bufnr = bufnr }
+    return 77
   end,
 })
 assert(vim.fn.exists(":HarnessdAsk") == 2)
 assert(vim.fn.exists(":HarnessdInline") == 2)
 assert(vim.fn.exists(":HarnessdScratch") == 2)
 assert(vim.fn.exists(":HarnessdThreads") == 2)
+assert(vim.fn.exists(":HarnessdSettings") == 2)
+assert(vim.fn.exists(":HarnessdModels") == 2)
+assert(vim.fn.exists(":HarnessdInlineComplete") == 2)
+assert(vim.fn.exists(":HarnessdPrepareContext") == 2)
 assert(vim.fn.exists(":HarnessdAccept") == 2)
 assert(vim.fn.maparg("<Plug>(HarnessdAccept)", "n") ~= "")
+assert(vim.fn.maparg("<Plug>(HarnessdAcceptLine)", "i") ~= "")
+assert(vim.fn.maparg("<Plug>(HarnessdInlineComplete)", "i") ~= "")
+assert(vim.fn.maparg("<Plug>(HarnessdPrepareContext)", "i") ~= "")
 assert(vim.fn.maparg("<Plug>(HarnessdScratch)", "n") ~= "")
+assert(vim.fn.maparg("<Plug>(HarnessdSettings)", "n") ~= "")
+assert(vim.fn.maparg("<Plug>(HarnessdModels)", "n") ~= "")
+assert(h.model_for("line", source) == "gpt-5.4-mini")
+assert(h.reasoning_effort_for("line", source) == "low")
+assert(h.model_for("ask", source) == nil)
+assert(h.model_for("scratch", source) == nil)
+assert(h.set_model("ask", { model = "gpt-5.5", reasoning_effort = "high" }, source) == "gpt-5.5")
+assert(h.set_model("scratch", { model = "gpt-5.4-mini", reasoning_effort = "low" }, source) == "gpt-5.4-mini")
+assert(h.get_models(source).ask.model == "gpt-5.5")
+assert(h.get_models(source).ask.reasoning_effort == "high")
+assert(h.is_auto_inline_enabled() == false)
+assert(h.statusline() == "autocomplete: [off] context: [idle] inline: [idle]")
+assert(h.toggle_auto_inline() == true)
+assert(h.is_auto_inline_enabled() == true)
+assert(h.statusline() == "autocomplete: [on] context: [idle] inline: [idle]")
+assert(h.toggle_auto_inline() == false)
+assert(h.statusline() == "autocomplete: [off] context: [idle] inline: [idle]")
+
+local prepare_done = false
+h.prepare_inline({ force = true }, function(_, err)
+  assert(err == nil)
+  prepare_done = true
+end)
+assert(h.context_status().state == "loading")
+assert(h.context_status().message == "preparing")
+assert(h.statusline():find("context: %[loading%]"))
+vim.wait(1000, function() return prepare_done end)
+assert(requests[#requests].args[2] == "bridge")
+assert(requests[#requests].args[4] == "inline.prepare")
+assert(has_arg_pair(requests[#requests].args, "--model", "gpt-5.4-mini"))
+assert(has_arg_pair(requests[#requests].args, "--reasoning-effort", "low"))
+assert(h.context_status().state == "ready")
+assert(h.context_status().last_attempt_at ~= nil)
+assert(h.context_status().last_ready_at ~= nil)
+assert(h.statusline() == "autocomplete: [off] context: [ready] inline: [idle]")
+
+mock_prepare_error = "context fetch failed"
+local prepare_failed = false
+h.prepare_inline({ force = true }, function(_, err)
+  assert(err:find("context fetch failed", 1, true))
+  prepare_failed = true
+end)
+vim.wait(1000, function() return prepare_failed end)
+assert(h.context_status().state == "failed")
+assert(h.context_status().message:find("context fetch failed", 1, true))
+assert(h.statusline():find("context: %[failed%]"))
+mock_prepare_error = nil
+
+mock_delay_inline_fast = true
+local delayed_done = false
+h.inline_complete({}, function(_, err)
+  assert(err == nil)
+  delayed_done = true
+end)
+assert(h.inline_status().state == "waiting")
+assert(h.statusline():find("inline: %[waiting%]"))
+pending_inline_fast()
+pending_inline_fast = nil
+mock_delay_inline_fast = false
+vim.wait(1000, function() return delayed_done end)
+assert(h.inline_status().state == "idle")
+assert(h.inline_status().source == "cache")
+assert(h.statusline():find("inline: %[idle%]"))
+
+mock_inline_fast_mode = "refresh"
+local refresh_done = false
+h.inline_complete({}, function(_, err)
+  assert(err == nil)
+  refresh_done = true
+end)
+vim.wait(1000, function() return refresh_done end)
+assert(h.inline_status().refresh == "queued")
+assert(h.statusline():find("inline: %[refresh%]"))
+mock_inline_fast_mode = "error"
+local failed_done = false
+h.inline_complete({}, function(_, err)
+  assert(err:find("inline fast unavailable", 1, true))
+  failed_done = true
+end)
+vim.wait(1000, function() return failed_done end)
+assert(h.inline_status().state == "failed")
+assert(h.inline_status().last_error:find("inline fast unavailable", 1, true))
+assert(h.statusline():find("inline: %[failed%]"))
+mock_inline_fast_mode = "suggestion"
 
 h.inline_ask()
 assert(#vim.api.nvim_list_wins() == 2, "ask should create a floating prompt window")
@@ -145,6 +294,8 @@ vim.wait(1000, function()
   return #vim.api.nvim_buf_get_extmarks(source, ns, 0, -1, {}) == 1
 end)
 assert(requests[#requests].args[2] == "inline")
+assert(has_arg_pair(requests[#requests].args, "--model", "gpt-5.4-mini"))
+assert(has_arg_pair(requests[#requests].args, "--reasoning-effort", "low"))
 assert(requests[#requests].opts.stdin:find("unsaved_value", 1, true))
 assert(#vim.api.nvim_buf_get_extmarks(source, ns, 0, -1, {}) == 1)
 h.accept()
@@ -178,6 +329,25 @@ assert(after == before, "stale preview must not insert")
 assert(#vim.api.nvim_buf_get_extmarks(source, ns, 0, -1, {}) == 0)
 
 vim.api.nvim_set_current_buf(source)
+vim.api.nvim_win_set_cursor(0, { 2, 4 })
+local inline_complete_done = false
+h.inline_complete({ prompt = "complete the line" }, function(_, err)
+  assert(err == nil)
+  inline_complete_done = true
+end)
+vim.wait(1000, function() return inline_complete_done end)
+assert(requests[#requests].args[2] == "bridge")
+assert(has_arg_pair(requests[#requests].args, "--method", "inline.fast"))
+assert(has_arg_pair(requests[#requests].args, "--model", "gpt-5.4-mini"))
+assert(has_arg_pair(requests[#requests].args, "--reasoning-effort", "low"))
+assert(#vim.api.nvim_buf_get_extmarks(source, ns, 0, -1, {}) == 1)
+h.accept_line()
+local line_only = table.concat(vim.api.nvim_buf_get_lines(source, 1, 2, false), "\n")
+assert(line_only:find("let added = true;", 1, true))
+assert(not line_only:find("return added;", 1, true))
+assert(#vim.api.nvim_buf_get_extmarks(source, ns, 0, -1, {}) == 0)
+
+vim.api.nvim_set_current_buf(source)
 local scratch_before = table.concat(vim.api.nvim_buf_get_lines(source, 0, -1, false), "\n")
 h.scratch_ask()
 local scratch_prompt = vim.api.nvim_get_current_buf()
@@ -194,6 +364,8 @@ vim.wait(1000, function()
   return requests[#requests] and requests[#requests].args[2] == "scratch"
 end)
 assert(requests[#requests].opts.stdin:find("fn changed", 1, true))
+assert(has_arg_pair(requests[#requests].args, "--model", "gpt-5.4-mini"))
+assert(has_arg_pair(requests[#requests].args, "--reasoning-effort", "low"))
 assert(table.concat(vim.api.nvim_buf_get_lines(source, 0, -1, false), "\n") == scratch_before)
 assert(#vim.api.nvim_buf_get_extmarks(source, ns, 0, -1, {}) == 0)
 vim.wait(1000, function()
@@ -227,9 +399,19 @@ assert(thread_submitted, "thread prompt should install a submit mapping")
 vim.wait(1000, function()
   return #launches == 1
 end)
+local thread_create_request = find_request("thread", "create")
+assert(thread_create_request ~= nil)
+assert(has_arg_pair(thread_create_request.args, "--model", "gpt-5.5"))
+assert(has_arg_pair(thread_create_request.args, "--reasoning-effort", "high"))
 assert(launches[1].argv[1] == "codex")
+assert(has_arg_pair(launches[1].argv, "--model", "gpt-5.5"))
+assert(has_arg_pair(launches[1].argv, "-c", "model_reasoning_effort=\"high\""))
+h.send_model_to_active_thread("gpt-5.5")
+assert(channel_sends[#channel_sends].channel == 77)
+assert(channel_sends[#channel_sends].data == "/model gpt-5.5\n")
 local thread_ns = vim.api.nvim_get_namespaces().harnessd_threads
 assert(#vim.api.nvim_buf_get_extmarks(source, thread_ns, 0, -1, {}) >= 1)
 
 vim.fn.delete(fixture)
 print("harnessd nvim headless tests passed")
+vim.cmd("qa!")

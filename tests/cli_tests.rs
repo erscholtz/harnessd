@@ -68,6 +68,10 @@ fn parses_bridge_complete_flags() {
         "src/main.rs",
         "--cursor",
         "12",
+        "--model",
+        "gpt-5.4-mini",
+        "--reasoning-effort",
+        "low",
     ]);
 
     match cli.command {
@@ -77,12 +81,18 @@ fn parses_bridge_complete_flags() {
             line,
             text,
             cursor,
+            model,
+            reasoning_effort,
+            no_background_refresh,
         } => {
             assert_eq!(method, "complete");
             assert_eq!(file.as_deref(), Some(std::path::Path::new("src/main.rs")));
             assert_eq!(line, None);
             assert_eq!(text, None);
             assert_eq!(cursor.as_deref(), Some("12"));
+            assert_eq!(model.as_deref(), Some("gpt-5.4-mini"));
+            assert_eq!(reasoning_effort.as_deref(), Some("low"));
+            assert!(!no_background_refresh);
         }
         _ => panic!("expected bridge command"),
     }
@@ -99,6 +109,10 @@ fn parses_inline_flags() {
         "12",
         "--prompt",
         "insert validation",
+        "--model",
+        "gpt-5.4-mini",
+        "--reasoning-effort",
+        "low",
     ]);
 
     match cli.command {
@@ -106,10 +120,14 @@ fn parses_inline_flags() {
             file,
             offset,
             prompt,
+            model,
+            reasoning_effort,
         } => {
             assert_eq!(file, std::path::PathBuf::from("src/main.rs"));
             assert_eq!(offset, 12);
             assert_eq!(prompt, "insert validation");
+            assert_eq!(model.as_deref(), Some("gpt-5.4-mini"));
+            assert_eq!(reasoning_effort.as_deref(), Some("low"));
         }
         _ => panic!("expected inline command"),
     }
@@ -132,6 +150,10 @@ fn parses_scratch_flags() {
         "1",
         "--selection-end",
         "5",
+        "--model",
+        "gpt-5.4-mini",
+        "--reasoning-effort",
+        "low",
     ]);
 
     match cli.command {
@@ -142,6 +164,8 @@ fn parses_scratch_flags() {
             prompt,
             selection_start,
             selection_end,
+            model,
+            reasoning_effort,
         } => {
             assert_eq!(workspace, std::path::PathBuf::from("."));
             assert_eq!(file, std::path::PathBuf::from("src/main.rs"));
@@ -149,6 +173,8 @@ fn parses_scratch_flags() {
             assert_eq!(prompt, "sketch usage");
             assert_eq!(selection_start, Some(1));
             assert_eq!(selection_end, Some(5));
+            assert_eq!(model.as_deref(), Some("gpt-5.4-mini"));
+            assert_eq!(reasoning_effort.as_deref(), Some("low"));
         }
         _ => panic!("expected scratch command"),
     }
@@ -198,6 +224,10 @@ fn parses_thread_create_flags() {
         "1",
         "--selection-end",
         "5",
+        "--model",
+        "gpt-5.5",
+        "--reasoning-effort",
+        "high",
     ]);
 
     match cli.command {
@@ -210,6 +240,8 @@ fn parses_thread_create_flags() {
                     prompt,
                     selection_start,
                     selection_end,
+                    model,
+                    reasoning_effort,
                 },
         } => {
             assert_eq!(workspace, std::path::PathBuf::from("."));
@@ -218,6 +250,8 @@ fn parses_thread_create_flags() {
             assert_eq!(prompt, "explain this");
             assert_eq!(selection_start, Some(1));
             assert_eq!(selection_end, Some(5));
+            assert_eq!(model.as_deref(), Some("gpt-5.5"));
+            assert_eq!(reasoning_effort.as_deref(), Some("high"));
         }
         _ => panic!("expected thread create command"),
     }

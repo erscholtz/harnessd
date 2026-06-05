@@ -132,6 +132,70 @@ pub struct InlineParams {
     pub content: String,
     /// User instruction for text to insert at the cursor.
     pub prompt: String,
+    /// Optional model override for this inline request.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional reasoning effort override for this inline request.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+/// Parameters for the `inline.fast` local-first inline completion path.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InlineFastParams {
+    /// Absolute source file path used for language and workspace selection.
+    pub file: String,
+    /// Cursor position as a byte offset into `content`.
+    pub offset: usize,
+    /// Current editor buffer contents, including unsaved edits.
+    pub content: String,
+    /// Optional prefix to filter cached suggestions.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// Optional prompt used only for background refresh.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Optional model override for background refresh.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional reasoning effort override for background refresh.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// Whether to queue a model refresh after a local miss.
+    #[serde(default)]
+    pub allow_background_refresh: bool,
+}
+
+/// Result returned by the `inline.fast` local-first inline completion path.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InlineFastResult {
+    /// Immediate local suggestion, if one was available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<CompletionSuggestion>,
+    /// Source of the immediate result: cache, anchor-cache, function-cache, or none.
+    pub source: String,
+    /// Whether a slower background model refresh was queued.
+    pub refresh_queued: bool,
+}
+
+/// Parameters for warming the reusable inline generation session.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InlinePrepareParams {
+    /// Absolute source file path used for workspace selection.
+    pub file: String,
+    /// Optional model override for the prepared inline session.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional reasoning effort override for the prepared inline session.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+/// Result returned after the inline generation session is ready.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InlinePrepareResult {
+    /// Whether the inline ACP session is ready.
+    pub prepared: bool,
 }
 
 /// Parameters for creating a saved scratch preview artifact.
@@ -153,6 +217,12 @@ pub struct ScratchCreateParams {
     /// Optional selected end byte.
     #[serde(default)]
     pub selection_end: Option<usize>,
+    /// Optional model override for this scratch request.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional reasoning effort override for this scratch request.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 /// Result returned after writing a scratch preview artifact.
@@ -261,6 +331,14 @@ pub struct DaemonMetricsSnapshot {
     pub total_requests: u64,
     /// Number of `complete` requests processed.
     pub complete_requests: u64,
+    /// Number of `inline.fast` requests processed.
+    pub inline_fast_requests: u64,
+    /// Number of `inline.fast` cache hits.
+    pub inline_fast_cache_hits: u64,
+    /// Number of background inline refresh jobs queued.
+    pub inline_fast_refresh_queued: u64,
+    /// Number of background inline refresh jobs completed successfully.
+    pub inline_fast_refresh_completed: u64,
     /// Number of `prefetch` requests processed.
     pub prefetch_requests: u64,
     /// Number of `status` requests processed.

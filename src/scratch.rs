@@ -90,7 +90,19 @@ impl ScratchClient {
         std::fs::write(&schema_path, scratch_schema())?;
         std::fs::remove_file(&output_path).ok();
 
-        let mut child = Command::new(&self.program)
+        let model = crate::models::normalize_model(params.model.clone())?;
+        let mut command = Command::new(&self.program);
+        if let Some(model) = model {
+            command.arg("--model").arg(model);
+        }
+        if let Some(effort) =
+            crate::models::normalize_reasoning_effort(params.reasoning_effort.clone())?
+        {
+            command
+                .arg("-c")
+                .arg(crate::models::reasoning_effort_config_arg(&effort));
+        }
+        let mut child = command
             .arg("--ask-for-approval")
             .arg("never")
             .arg("--sandbox")
@@ -517,6 +529,8 @@ mod tests {
             prompt: "demo".to_string(),
             selection_start: None,
             selection_end: None,
+            model: None,
+            reasoning_effort: None,
         };
         assert!(validate_params(&base).is_ok());
 

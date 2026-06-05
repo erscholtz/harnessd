@@ -6,6 +6,25 @@ local config = {
   sidebar_width = 72,
   session_limit = 50,
   thread_sign_text = "H",
+  auto_inline = false,
+  auto_inline_delay_ms = 250,
+  fast_inline = true,
+  fast_inline_background_refresh = true,
+  inline_refresh_indicator_ms = 4000,
+  prepare_context_on_buf_enter = true,
+  inline_completion_prompt = "Complete the code at the cursor with the smallest useful insertion.",
+  model_presets = {
+    { label = "default", model = nil, reasoning_effort = nil },
+    { label = "gpt-5.4-mini / low", model = "gpt-5.4-mini", reasoning_effort = "low" },
+    { label = "gpt-5.4-mini / medium", model = "gpt-5.4-mini", reasoning_effort = "medium" },
+    { label = "gpt-5.5 / medium", model = "gpt-5.5", reasoning_effort = "medium" },
+    { label = "gpt-5.5 / high", model = "gpt-5.5", reasoning_effort = "high" },
+  },
+  model_roles = {
+    ask = { model = nil, reasoning_effort = nil },
+    line = { model = "gpt-5.4-mini", reasoning_effort = "low" },
+    scratch = { model = nil, reasoning_effort = nil },
+  },
 }
 
 local namespace = vim.api.nvim_create_namespace("harnessd_preview")
@@ -16,6 +35,29 @@ local sidebar = nil
 local thread_sign_group = "harnessd_threads"
 local thread_sign_id = 1000
 local current_threads = {}
+local auto_inline_timer = nil
+local auto_inline_running = false
+local auto_inline_pending = false
+local last_auto_inline_key = nil
+local inline_refresh_timer = nil
+local inline_status = {
+  state = "idle",
+  source = nil,
+  message = nil,
+  refresh = "idle",
+  last_error = nil,
+}
+local context_status = {
+  state = "idle",
+  file = nil,
+  message = nil,
+  last_attempt_at = nil,
+  last_ready_at = nil,
+}
+local buffer_models = {}
+local settings_window = nil
+local model_roles = { "ask", "line", "scratch" }
+local render_settings_window
 
 local function merge_config(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
@@ -102,6 +144,80 @@ local function workspace()
   return vim.fn.getcwd()
 end
 
+local function insert_mode_active()
+  local mode = vim.api.nvim_get_mode().mode
+  return mode:sub(1, 1) == "i"
+end
+
+local function normalize_model(model)
+  if model == nil then
+    return nil
+  end
+  if type(model) ~= "string" then
+    return nil
+  end
+  model = model:gsub("^%s+", ""):gsub("%s+$", "")
+  if model == "" or model == "default" then
+    return nil
+  end
+  return model
+end
+
+local function normalize_reasoning_effort(effort)
+  if effort == nil then
+    return nil
+  end
+  if type(effort) ~= "string" then
+    return nil
+  end
+  effort = effort:gsub("^%s+", ""):gsub("%s+$", "")
+  if effort == "" or effort == "default" then
+    return nil
+  end
+  return effort
+end
+
+local function normalize_profile(value, effort)
+  if type(value) == "table" then
+    return {
+      model = normalize_model(value.model or value.value),
+      reasoning_effort = normalize_reasoning_effort(value.reasoning_effort or value.effort),
+    }
+  end
+  return {
+    model = normalize_model(value),
+    reasoning_effort = normalize_reasoning_effort(effort),
+  }
+end
+
+local function default_models()
+  return {
+    ask = normalize_profile(config.model_roles.ask),
+    line = normalize_profile(config.model_roles.line),
+    scratch = normalize_profile(config.model_roles.scratch),
+  }
+end
+
+local function model_label(profile)
+  profile = normalize_profile(profile)
+  if not profile.model and not profile.reasoning_effort then
+    return "default"
+  end
+  return (profile.model or "default") .. " / " .. (profile.reasoning_effort or "default")
+end
+
+local function add_model_args(args, model, effort)
+  local profile = normalize_profile(model, effort)
+  if profile.model then
+    table.insert(args, "--model")
+    table.insert(args, profile.model)
+  end
+  if profile.reasoning_effort then
+    table.insert(args, "--reasoning-effort")
+    table.insert(args, profile.reasoning_effort)
+  end
+end
+
 local function sign_define()
   pcall(vim.fn.sign_define, "HarnessdThread", {
     text = config.thread_sign_text,
@@ -156,9 +272,239 @@ local function clear_preview()
   preview = nil
 end
 
+local function stop_auto_inline_timer()
+  if auto_inline_timer then
+    pcall(function()
+      auto_inline_timer:stop()
+      auto_inline_timer:close()
+    end)
+    auto_inline_timer = nil
+  end
+end
+
+local function stop_inline_refresh_timer()
+  if inline_refresh_timer then
+    pcall(function()
+      inline_refresh_timer:stop()
+      inline_refresh_timer:close()
+    end)
+    inline_refresh_timer = nil
+  end
+end
+
+local function set_inline_status(next_status)
+  inline_status = vim.tbl_extend("force", inline_status, next_status or {})
+  vim.cmd("redrawstatus")
+  if settings_window then
+    render_settings_window()
+  end
+end
+
+local function schedule_inline_refresh_reset()
+  stop_inline_refresh_timer()
+  inline_refresh_timer = vim.defer_fn(function()
+    inline_refresh_timer = nil
+    if inline_status.refresh == "queued" or inline_status.refresh == "running" then
+      set_inline_status({ refresh = "idle" })
+    end
+  end, config.inline_refresh_indicator_ms)
+end
+
+local function insert_preview_text(text)
+  if not preview then
+    return false
+  end
+  local active = preview
+  if not vim.api.nvim_buf_is_valid(active.bufnr)
+      or vim.api.nvim_get_current_buf() ~= active.bufnr
+      or vim.api.nvim_buf_get_changedtick(active.bufnr) ~= active.changedtick then
+    clear_preview()
+    vim.notify("discarded harnessd suggestion because the buffer changed", vim.log.levels.WARN)
+    return true
+  end
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  if cursor[1] - 1 ~= active.row or cursor[2] ~= active.col then
+    clear_preview()
+    vim.notify("discarded harnessd suggestion because the cursor moved", vim.log.levels.WARN)
+    return true
+  end
+
+  local lines = vim.split(text, "\n", { plain = true })
+  clear_preview()
+  vim.api.nvim_buf_set_text(active.bufnr, active.row, active.col, active.row, active.col, lines)
+  local end_row = active.row + #lines - 1
+  local end_col = #lines == 1 and active.col + #lines[1] or #lines[#lines]
+  vim.api.nvim_win_set_cursor(0, { end_row + 1, end_col })
+  return true
+end
+
 function M.dismiss()
   clear_preview()
   close_prompt()
+end
+
+function M.get_models(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if not buffer_models[bufnr] then
+    buffer_models[bufnr] = default_models()
+  end
+  return vim.deepcopy(buffer_models[bufnr])
+end
+
+function M.set_model(role, model, bufnr, reasoning_effort)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if role ~= "ask" and role ~= "line" and role ~= "scratch" then
+    return nil, "unknown model role: " .. tostring(role)
+  end
+  if not buffer_models[bufnr] then
+    buffer_models[bufnr] = default_models()
+  end
+  buffer_models[bufnr][role] = normalize_profile(model, reasoning_effort)
+  return buffer_models[bufnr][role].model
+end
+
+function M.model_for(role, bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if not buffer_models[bufnr] then
+    buffer_models[bufnr] = default_models()
+  end
+  return (buffer_models[bufnr][role] or {}).model
+end
+
+function M.reasoning_effort_for(role, bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if not buffer_models[bufnr] then
+    buffer_models[bufnr] = default_models()
+  end
+  return (buffer_models[bufnr][role] or {}).reasoning_effort
+end
+
+function M.is_auto_inline_enabled()
+  return config.auto_inline == true
+end
+
+function M.set_auto_inline(enabled)
+  config.auto_inline = enabled == true
+  if config.auto_inline then
+    M.schedule_auto_inline()
+  else
+    stop_auto_inline_timer()
+    auto_inline_pending = false
+    last_auto_inline_key = nil
+    clear_preview()
+  end
+  vim.cmd("redrawstatus")
+  return config.auto_inline
+end
+
+function M.toggle_auto_inline()
+  return M.set_auto_inline(not config.auto_inline)
+end
+
+function M.statusline()
+  local context = context_status.state or "idle"
+  local inline = "idle"
+  if inline_status.state == "failed" then
+    inline = "failed"
+  elseif inline_status.state == "waiting" then
+    inline = "waiting"
+  elseif inline_status.refresh == "queued" or inline_status.refresh == "running" then
+    inline = "refresh"
+  end
+  if config.auto_inline then
+    return "autocomplete: [on] context: [" .. context .. "] inline: [" .. inline .. "]"
+  end
+  return "autocomplete: [off] context: [" .. context .. "] inline: [" .. inline .. "]"
+end
+
+function M.context_status()
+  return vim.deepcopy(context_status)
+end
+
+function M.inline_status()
+  return vim.deepcopy(inline_status)
+end
+
+function M.prepare_inline(opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
+  if config.prepare_context_on_buf_enter == false and not opts.force then
+    callback(nil, "context preparation disabled")
+    return
+  end
+
+  local bufnr = opts.bufnr or vim.api.nvim_get_current_buf()
+  if vim.bo[bufnr].buftype ~= "" then
+    callback(nil, "context preparation requires a normal file buffer")
+    return
+  end
+
+  local file, file_err = current_file(bufnr)
+  if not file then
+    callback(nil, file_err)
+    return
+  end
+  if context_status.file == file and context_status.state == "loading" then
+    callback(nil, "context preparation already running")
+    return
+  end
+
+  context_status = {
+    state = "loading",
+    file = file,
+    message = "preparing",
+    last_attempt_at = os.time(),
+    last_ready_at = context_status.last_ready_at,
+  }
+  vim.cmd("redrawstatus")
+  if settings_window then
+    render_settings_window()
+  end
+
+  local args = {
+    config.command,
+    "bridge",
+    "--method",
+    "inline.prepare",
+    "--file",
+    file,
+  }
+  add_model_args(
+    args,
+    opts.model or M.model_for("line", bufnr),
+    opts.reasoning_effort or M.reasoning_effort_for("line", bufnr)
+  )
+
+  run_command(args, nil, function(response, err)
+    if err then
+      context_status = {
+        state = "failed",
+        file = file,
+        message = err,
+        last_attempt_at = context_status.last_attempt_at,
+        last_ready_at = context_status.last_ready_at,
+      }
+      vim.cmd("redrawstatus")
+      if settings_window then
+        render_settings_window()
+      end
+      callback(nil, err)
+      return
+    end
+
+    context_status = {
+      state = "ready",
+      file = file,
+      message = nil,
+      last_attempt_at = context_status.last_attempt_at,
+      last_ready_at = os.time(),
+    }
+    vim.cmd("redrawstatus")
+    if settings_window then
+      render_settings_window()
+    end
+    callback(response, nil)
+  end)
 end
 
 local function render_preview(bufnr, cursor, insert_text, source)
@@ -253,7 +599,7 @@ function M.inline(opts, callback)
     return
   end
 
-  run_command({
+  local args = {
     config.command,
     "inline",
     "--file",
@@ -262,9 +608,224 @@ function M.inline(opts, callback)
     tostring(offset),
     "--prompt",
     prompt_text,
-  }, {
+  }
+  add_model_args(args, opts.model, opts.reasoning_effort)
+
+  run_command(args, {
     stdin = opts.content or buffer_content(bufnr),
   }, callback)
+end
+
+function M.inline_fast(opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
+  local bufnr = opts.bufnr or vim.api.nvim_get_current_buf()
+  local file = opts.file or select(1, current_file(bufnr))
+  if not file then
+    callback(nil, "file path is required")
+    return
+  end
+
+  local offset = opts.offset
+  if offset == nil then
+    local current = select(1, position(bufnr))
+    offset = current and current.offset or nil
+  end
+  if offset == nil then
+    callback(nil, "byte offset is required")
+    return
+  end
+
+  local args = {
+    config.command,
+    "bridge",
+    "--method",
+    "inline.fast",
+    "--file",
+    file,
+    "--cursor",
+    tostring(offset),
+  }
+  if opts.prompt and opts.prompt ~= "" then
+    table.insert(args, "--text")
+    table.insert(args, opts.prompt)
+  end
+  add_model_args(args, opts.model, opts.reasoning_effort)
+  if opts.allow_background_refresh == false then
+    table.insert(args, "--no-background-refresh")
+  end
+
+  run_command(args, {
+    stdin = opts.content or buffer_content(bufnr),
+  }, callback)
+end
+
+function M.inline_complete(opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
+  local source_bufnr = opts.bufnr or vim.api.nvim_get_current_buf()
+  local file, file_err = current_file(source_bufnr)
+  local cursor, cursor_err = position(source_bufnr)
+  if opts.require_insert_mode and not insert_mode_active() then
+    callback(nil, "insert mode is no longer active")
+    return
+  end
+  if vim.bo[source_bufnr].buftype ~= "" then
+    callback(nil, "harnessd inline completion requires a normal file buffer")
+    return
+  end
+  if not file or not cursor then
+    local err = file_err or cursor_err
+    if not opts.silent then
+      vim.notify(err, vim.log.levels.ERROR)
+    end
+    callback(nil, err)
+    return
+  end
+
+  local content = buffer_content(source_bufnr)
+  local changedtick = vim.api.nvim_buf_get_changedtick(source_bufnr)
+  local request = config.fast_inline and M.inline_fast or M.inline
+  set_inline_status({
+    state = "waiting",
+    source = nil,
+    message = "requesting",
+    last_error = nil,
+  })
+  request({
+    bufnr = source_bufnr,
+    file = file,
+    offset = cursor.offset,
+    content = content,
+    prompt = opts.prompt or config.inline_completion_prompt,
+    model = opts.model or M.model_for("line", source_bufnr),
+    reasoning_effort = opts.reasoning_effort or M.reasoning_effort_for("line", source_bufnr),
+    allow_background_refresh = config.fast_inline_background_refresh,
+  }, function(response, err)
+    if err then
+      set_inline_status({
+        state = "failed",
+        message = err,
+        last_error = err,
+        refresh = "idle",
+      })
+      if not opts.silent then
+        vim.notify(err, vim.log.levels.ERROR)
+      end
+      callback(nil, err)
+      return
+    end
+    if opts.require_insert_mode and not insert_mode_active() then
+      set_inline_status({
+        state = "idle",
+        message = "stale",
+      })
+      callback(nil, "insert mode is no longer active")
+      return
+    end
+    if not vim.api.nvim_buf_is_valid(source_bufnr)
+        or vim.api.nvim_get_current_buf() ~= source_bufnr
+        or vim.api.nvim_buf_get_changedtick(source_bufnr) ~= changedtick
+        or buffer_content(source_bufnr) ~= content then
+      set_inline_status({
+        state = "idle",
+        message = "stale",
+      })
+      callback(nil, "buffer changed while fetching inline completion")
+      return
+    end
+    local current_cursor = vim.api.nvim_win_get_cursor(0)
+    if current_cursor[1] - 1 ~= cursor.row or current_cursor[2] ~= cursor.col then
+      set_inline_status({
+        state = "idle",
+        message = "stale",
+      })
+      callback(nil, "cursor moved while fetching inline completion")
+      return
+    end
+
+    local result = (response or {}).result or {}
+    local suggestion = result.suggestion
+    if suggestion then
+      stop_inline_refresh_timer()
+      set_inline_status({
+        state = "idle",
+        source = result.source or "generated",
+        message = nil,
+        refresh = "idle",
+      })
+      render_preview(source_bufnr, cursor, suggestion.insert_text, opts.source or "inline_complete")
+    elseif result.refresh_queued == true then
+      set_inline_status({
+        state = "idle",
+        source = result.source or "none",
+        message = "refresh queued",
+        refresh = "queued",
+      })
+      schedule_inline_refresh_reset()
+    else
+      set_inline_status({
+        state = "idle",
+        source = result.source or "none",
+        message = "no suggestion",
+      })
+    end
+    callback(response, nil)
+  end)
+end
+
+function M.schedule_auto_inline()
+  if not config.auto_inline or not insert_mode_active() then
+    return
+  end
+  local bufnr = vim.api.nvim_get_current_buf()
+  if vim.bo[bufnr].buftype ~= "" or vim.api.nvim_buf_get_name(bufnr) == "" then
+    return
+  end
+  clear_preview()
+
+  stop_auto_inline_timer()
+
+  auto_inline_timer = vim.defer_fn(function()
+    auto_inline_timer = nil
+    if not config.auto_inline or not insert_mode_active() then
+      return
+    end
+    local target_bufnr = vim.api.nvim_get_current_buf()
+    local cursor = select(1, position(target_bufnr))
+    if not cursor then
+      return
+    end
+    local key = table.concat({
+      tostring(target_bufnr),
+      tostring(vim.api.nvim_buf_get_changedtick(target_bufnr)),
+      tostring(cursor.row),
+      tostring(cursor.col),
+    }, ":")
+    if key == last_auto_inline_key then
+      return
+    end
+    if auto_inline_running then
+      auto_inline_pending = true
+      return
+    end
+
+    auto_inline_running = true
+    last_auto_inline_key = key
+    M.inline_complete({
+      bufnr = target_bufnr,
+      prompt = config.inline_completion_prompt,
+      require_insert_mode = true,
+      silent = true,
+      source = "auto_inline",
+    }, function()
+      auto_inline_running = false
+      if auto_inline_pending then
+        auto_inline_pending = false
+        M.schedule_auto_inline()
+      end
+    end)
+  end, config.auto_inline_delay_ms)
 end
 
 function M.scratch(opts, callback)
@@ -310,6 +871,7 @@ function M.scratch(opts, callback)
     table.insert(args, "--selection-end")
     table.insert(args, tostring(opts.selection_end))
   end
+  add_model_args(args, opts.model, opts.reasoning_effort)
 
   run_command(args, {
     stdin = opts.content or buffer_content(bufnr),
@@ -396,6 +958,7 @@ function M.thread_create(opts, callback)
     table.insert(args, "--selection-end")
     table.insert(args, tostring(opts.selection_end))
   end
+  add_model_args(args, opts.model, opts.reasoning_effort)
   run_command(args, { stdin = opts.content or "" }, callback)
 end
 
@@ -508,29 +1071,17 @@ end
 
 function M.accept()
   if not preview then
-    return
+    return false
   end
-  local active = preview
-  if not vim.api.nvim_buf_is_valid(active.bufnr)
-      or vim.api.nvim_get_current_buf() ~= active.bufnr
-      or vim.api.nvim_buf_get_changedtick(active.bufnr) ~= active.changedtick then
-    clear_preview()
-    vim.notify("discarded harnessd suggestion because the buffer changed", vim.log.levels.WARN)
-    return
-  end
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  if cursor[1] - 1 ~= active.row or cursor[2] ~= active.col then
-    clear_preview()
-    vim.notify("discarded harnessd suggestion because the cursor moved", vim.log.levels.WARN)
-    return
-  end
+  return insert_preview_text(preview.insert_text)
+end
 
-  local lines = vim.split(active.insert_text, "\n", { plain = true })
-  clear_preview()
-  vim.api.nvim_buf_set_text(active.bufnr, active.row, active.col, active.row, active.col, lines)
-  local end_row = active.row + #lines - 1
-  local end_col = #lines == 1 and active.col + #lines[1] or #lines[#lines]
-  vim.api.nvim_win_set_cursor(0, { end_row + 1, end_col })
+function M.accept_line()
+  if not preview then
+    return false
+  end
+  local first_line = vim.split(preview.insert_text, "\n", { plain = true })[1] or ""
+  return insert_preview_text(first_line)
 end
 
 function M.inline_ask(opts, callback)
@@ -576,6 +1127,8 @@ function M.inline_ask(opts, callback)
       offset = cursor.offset,
       content = content,
       prompt = value,
+      model = opts.model or M.model_for("line", source_bufnr),
+      reasoning_effort = opts.reasoning_effort or M.reasoning_effort_for("line", source_bufnr),
     }, function(response, err)
       if err then
         vim.notify(err, vim.log.levels.ERROR)
@@ -620,6 +1173,7 @@ local function ensure_sidebar()
     mode = "list",
     items = {},
     terminal_buffers = {},
+    active_terminal = nil,
     attach = nil,
   }
   vim.keymap.set("n", "<CR>", function() M.sidebar_open_selected() end, { buffer = bufnr, nowait = true })
@@ -662,11 +1216,18 @@ local function launch_codex(launch)
   vim.api.nvim_set_current_win(sidebar.winid)
   vim.bo[term_bufnr].bufhidden = "hide"
   sidebar.terminal_buffers[table.concat(argv, "\0")] = term_bufnr
+  local job_id = nil
   if config.terminal_launcher then
-    config.terminal_launcher(argv, { cwd = launch.cwd }, term_bufnr)
+    job_id = config.terminal_launcher(argv, { cwd = launch.cwd }, term_bufnr)
   else
-    vim.fn.termopen(argv, { cwd = launch.cwd })
+    job_id = vim.fn.termopen(argv, { cwd = launch.cwd })
   end
+  sidebar.active_terminal = {
+    job_id = job_id,
+    argv = argv,
+    cwd = launch.cwd,
+    bufnr = term_bufnr,
+  }
   vim.cmd("startinsert")
   return term_bufnr, bufnr
 end
@@ -683,6 +1244,184 @@ local function launch_session(session, prompt_text)
   end
   local launch = { argv = argv, cwd = session.cwd or workspace(), started_after_unix = os.time() }
   return launch_codex(launch)
+end
+
+function M.send_model_to_active_thread(model)
+  model = normalize_model(model or M.model_for("ask"))
+  if not model then
+    vim.notify("/model requires a concrete ask model", vim.log.levels.WARN)
+    return false
+  end
+  if not sidebar or not sidebar.active_terminal or not sidebar.active_terminal.job_id then
+    vim.notify("no active Codex terminal for /model", vim.log.levels.WARN)
+    return false
+  end
+  vim.api.nvim_chan_send(sidebar.active_terminal.job_id, "/model " .. model .. "\n")
+  vim.notify("sent /model " .. model, vim.log.levels.INFO)
+  return true
+end
+
+local function close_settings_window()
+  if settings_window and settings_window.winid and vim.api.nvim_win_is_valid(settings_window.winid) then
+    vim.api.nvim_win_close(settings_window.winid, true)
+  end
+  if settings_window and settings_window.bufnr and vim.api.nvim_buf_is_valid(settings_window.bufnr) then
+    vim.api.nvim_buf_delete(settings_window.bufnr, { force = true })
+  end
+  settings_window = nil
+end
+
+local function setting_at_cursor()
+  if not settings_window or not settings_window.winid or not vim.api.nvim_win_is_valid(settings_window.winid) then
+    return nil
+  end
+  local row = vim.api.nvim_win_get_cursor(settings_window.winid)[1]
+  return settings_window.rows and settings_window.rows[row]
+end
+
+local function compact_status_text(value, limit)
+  value = tostring(value or "none"):gsub("%s+", " ")
+  limit = limit or 48
+  if #value > limit then
+    return value:sub(1, limit - 1) .. "..."
+  end
+  return value
+end
+
+function render_settings_window()
+  if not settings_window or not vim.api.nvim_buf_is_valid(settings_window.bufnr) then
+    return
+  end
+  local models = M.get_models(settings_window.source_bufnr)
+  local lines = { "harnessd settings", "", "models" }
+  local rows = {}
+  for _, role in ipairs(model_roles) do
+    rows[#lines + 1] = { kind = "model", role = role }
+    lines[#lines + 1] = string.format("%-8s %s", role, model_label(models[role]))
+  end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "behavior"
+  rows[#lines + 1] = { kind = "toggle", key = "auto_inline" }
+  lines[#lines + 1] = string.format("%-16s %s", "auto inline", config.auto_inline and "on" or "off")
+  rows[#lines + 1] = { kind = "toggle", key = "prepare_context_on_buf_enter" }
+  lines[#lines + 1] = string.format(
+    "%-16s %s",
+    "prepare context",
+    config.prepare_context_on_buf_enter and "on" or "off"
+  )
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "status"
+  rows[#lines + 1] = { kind = "status" }
+  lines[#lines + 1] = string.format("%-16s %s", "context", context_status.state or "idle")
+  rows[#lines + 1] = { kind = "status" }
+  lines[#lines + 1] = string.format("%-16s %s", "inline", inline_status.state or "idle")
+  rows[#lines + 1] = { kind = "status" }
+  lines[#lines + 1] = string.format("%-16s %s", "refresh", inline_status.refresh or "idle")
+  rows[#lines + 1] = { kind = "status" }
+  lines[#lines + 1] = string.format("%-16s %s", "last error", compact_status_text(inline_status.last_error))
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "<CR> change/toggle  r reset  / send ask /model  q close"
+  settings_window.rows = rows
+  vim.bo[settings_window.bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(settings_window.bufnr, 0, -1, false, lines)
+  vim.bo[settings_window.bufnr].modifiable = false
+end
+
+local function choose_model_for_role(role)
+  if not role then
+    return
+  end
+  vim.ui.select(config.model_presets, {
+    prompt = "Harnessd " .. role .. " model",
+    format_item = function(item)
+      return item.label or model_label(item)
+    end,
+  }, function(choice)
+    if not choice then
+      return
+    end
+    M.set_model(role, choice, settings_window and settings_window.source_bufnr or nil)
+    render_settings_window()
+  end)
+end
+
+local function change_setting(setting)
+  if not setting then
+    return
+  end
+  if setting.kind == "model" then
+    choose_model_for_role(setting.role)
+  elseif setting.kind == "toggle" then
+    if setting.key == "auto_inline" then
+      M.set_auto_inline(not config.auto_inline)
+    else
+      config[setting.key] = not config[setting.key]
+      vim.cmd("redrawstatus")
+    end
+    render_settings_window()
+  end
+end
+
+local function reset_setting(setting)
+  if not setting then
+    return
+  end
+  if setting.kind == "model" then
+    M.set_model(setting.role, config.model_roles[setting.role], settings_window.source_bufnr)
+  elseif setting.kind == "toggle" then
+    if setting.key == "auto_inline" then
+      M.set_auto_inline(false)
+    elseif setting.key == "prepare_context_on_buf_enter" then
+      config.prepare_context_on_buf_enter = true
+      vim.cmd("redrawstatus")
+    end
+  end
+  render_settings_window()
+end
+
+function M.open_settings(opts)
+  opts = opts or {}
+  local source_bufnr = opts.bufnr or vim.api.nvim_get_current_buf()
+  close_settings_window()
+  local bufnr = vim.api.nvim_create_buf(false, true)
+  vim.bo[bufnr].buftype = "nofile"
+  vim.bo[bufnr].bufhidden = "wipe"
+  vim.bo[bufnr].swapfile = false
+  vim.bo[bufnr].filetype = "harnessd-settings"
+  local width = math.max(44, math.min(72, vim.o.columns - 6))
+  local height = 11
+  local winid = vim.api.nvim_open_win(bufnr, true, {
+    relative = "editor",
+    row = math.max(1, math.floor((vim.o.lines - height) / 3)),
+    col = math.max(0, math.floor((vim.o.columns - width) / 2)),
+    width = width,
+    height = height,
+    style = "minimal",
+    border = "rounded",
+    title = " Harnessd Settings ",
+    title_pos = "center",
+  })
+  settings_window = { bufnr = bufnr, winid = winid, source_bufnr = source_bufnr, rows = {} }
+  render_settings_window()
+  vim.keymap.set("n", "q", close_settings_window, { buffer = bufnr, nowait = true })
+  vim.keymap.set("n", "<CR>", function()
+    change_setting(setting_at_cursor())
+  end, { buffer = bufnr, nowait = true })
+  vim.keymap.set("n", "r", function()
+    reset_setting(setting_at_cursor())
+  end, { buffer = bufnr, nowait = true })
+  vim.keymap.set("n", "/", function()
+    local setting = setting_at_cursor()
+    if setting and setting.kind == "model" and setting.role == "ask" then
+      M.send_model_to_active_thread(M.model_for("ask", source_bufnr))
+    else
+      vim.notify("/model applies to the ask role", vim.log.levels.WARN)
+    end
+  end, { buffer = bufnr, nowait = true })
+end
+
+function M.open_models(opts)
+  return M.open_settings(opts)
 end
 
 local function mark_threads(bufnr, threads)
@@ -853,6 +1592,8 @@ function M.scratch_ask(opts, callback)
       prompt = value,
       selection_start = selection_start,
       selection_end = selection_end,
+      model = opts.model or M.model_for("scratch", source_bufnr),
+      reasoning_effort = opts.reasoning_effort or M.reasoning_effort_for("scratch", source_bufnr),
     }, function(response, err)
       if err then
         vim.notify(err, vim.log.levels.ERROR)
@@ -915,6 +1656,8 @@ function M.thread_ask(opts, callback)
       offset = cursor.offset,
       content = content,
       prompt = value,
+      model = opts.model or M.model_for("ask", source_bufnr),
+      reasoning_effort = opts.reasoning_effort or M.reasoning_effort_for("ask", source_bufnr),
     }, function(response, err)
       if err then
         vim.notify(err, vim.log.levels.ERROR)
@@ -1020,6 +1763,18 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("HarnessdThreadOpen", function() M.thread_open_current() end, {})
   vim.api.nvim_create_user_command("HarnessdThreadAttach", function() M.thread_attach_current() end, {})
   vim.api.nvim_create_user_command("HarnessdComplete", function() M.preview_complete() end, {})
+  vim.api.nvim_create_user_command("HarnessdSettings", function() M.open_settings() end, {})
+  vim.api.nvim_create_user_command("HarnessdModels", function() M.open_settings() end, {})
+  vim.api.nvim_create_user_command("HarnessdInlineComplete", function()
+    M.inline_complete({ silent = false })
+  end, {})
+  vim.api.nvim_create_user_command("HarnessdPrepareContext", function()
+    M.prepare_inline({ force = true }, function(_, err)
+      if err then
+        vim.notify(err, vim.log.levels.WARN)
+      end
+    end)
+  end, {})
   vim.api.nvim_create_user_command("HarnessdAccept", function() M.accept() end, {})
   vim.api.nvim_create_user_command("HarnessdDismiss", function() M.dismiss() end, {})
 
@@ -1030,16 +1785,44 @@ function M.setup(opts)
       M.refresh_thread_marks(event.buf)
     end,
   })
+  vim.api.nvim_create_autocmd({ "BufEnter", "BufReadPost" }, {
+    group = vim.api.nvim_create_augroup("harnessd_context_prepare", { clear = true }),
+    callback = function(event)
+      M.prepare_inline({ bufnr = event.buf }, function() end)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ "InsertEnter", "TextChangedI", "CursorMovedI" }, {
+    group = vim.api.nvim_create_augroup("harnessd_auto_inline", { clear = true }),
+    callback = function()
+      M.schedule_auto_inline()
+    end,
+  })
+  vim.api.nvim_create_autocmd("InsertLeave", {
+    group = vim.api.nvim_create_augroup("harnessd_auto_inline_cleanup", { clear = true }),
+    callback = function()
+      stop_auto_inline_timer()
+      last_auto_inline_key = nil
+      clear_preview()
+    end,
+  })
 
   vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdAsk)", function() M.thread_ask() end)
   vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdInline)", function() M.inline_ask() end)
+  vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdInlineComplete)", function() M.inline_complete() end)
+  vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdPrepareContext)", function()
+    M.prepare_inline({ force = true }, function() end)
+  end)
   vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdScratch)", function() M.scratch_ask() end)
   vim.keymap.set("v", "<Plug>(HarnessdScratch)", function() M.scratch_ask({ use_visual_selection = true }) end)
   vim.keymap.set("n", "<Plug>(HarnessdThreads)", function() M.sidebar_toggle() end)
   vim.keymap.set("n", "<Plug>(HarnessdThreadOpen)", function() M.thread_open_current() end)
   vim.keymap.set("n", "<Plug>(HarnessdThreadAttach)", function() M.thread_attach_current() end)
   vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdComplete)", function() M.preview_complete() end)
+  vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdSettings)", function() M.open_settings() end)
+  vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdModels)", function() M.open_settings() end)
   vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdAccept)", function() M.accept() end)
+  vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdAcceptLine)", function() M.accept_line() end)
   vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdDismiss)", function() M.dismiss() end)
 end
 

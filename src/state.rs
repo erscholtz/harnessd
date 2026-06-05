@@ -35,6 +35,7 @@ pub struct DaemonState {
     started_at_unix: u64,
     metrics: DaemonMetrics,
     failed_regions: RwLock<HashSet<String>>,
+    inline_refresh_jobs: RwLock<HashSet<String>>,
 }
 
 impl DaemonState {
@@ -76,6 +77,7 @@ impl DaemonState {
             started_at_unix: unix_timestamp(),
             metrics: DaemonMetrics::default(),
             failed_regions: RwLock::new(HashSet::new()),
+            inline_refresh_jobs: RwLock::new(HashSet::new()),
         }))
     }
 
@@ -94,6 +96,42 @@ impl DaemonState {
         self.failed_regions.read().await.contains(key)
     }
 
+    /// Record a background inline refresh if an equivalent job is not already active.
+    pub async fn start_inline_refresh(&self, key: String) -> bool {
+        self.inline_refresh_jobs.write().await.insert(key)
+    }
+
+    /// Clear an active background inline refresh key.
+    pub async fn finish_inline_refresh(&self, key: &str) {
+        self.inline_refresh_jobs.write().await.remove(key);
+    }
+
+    /// Number of active background inline refresh jobs.
+    pub async fn active_inline_refresh_jobs(&self) -> usize {
+        self.inline_refresh_jobs.read().await.len()
+    }
+
+    /// Record an immediate cache hit from `inline.fast`.
+    pub fn record_inline_fast_cache_hit(&self) {
+        self.metrics
+            .inline_fast_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a queued background refresh from `inline.fast`.
+    pub fn record_inline_fast_refresh_queued(&self) {
+        self.metrics
+            .inline_fast_refresh_queued
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a completed background refresh from `inline.fast`.
+    pub fn record_inline_fast_refresh_completed(&self) {
+        self.metrics
+            .inline_fast_refresh_completed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record an incoming JSON-RPC method call for diagnostics.
     pub fn record_request(&self, method: &str) {
         self.metrics.total_requests.fetch_add(1, Ordering::Relaxed);
@@ -101,6 +139,11 @@ impl DaemonState {
             "complete" => {
                 self.metrics
                     .complete_requests
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "inline.fast" => {
+                self.metrics
+                    .inline_fast_requests
                     .fetch_add(1, Ordering::Relaxed);
             }
             "prefetch" => {
@@ -155,6 +198,16 @@ impl DaemonState {
             metrics: DaemonMetricsSnapshot {
                 total_requests: self.metrics.total_requests.load(Ordering::Relaxed),
                 complete_requests: self.metrics.complete_requests.load(Ordering::Relaxed),
+                inline_fast_requests: self.metrics.inline_fast_requests.load(Ordering::Relaxed),
+                inline_fast_cache_hits: self.metrics.inline_fast_cache_hits.load(Ordering::Relaxed),
+                inline_fast_refresh_queued: self
+                    .metrics
+                    .inline_fast_refresh_queued
+                    .load(Ordering::Relaxed),
+                inline_fast_refresh_completed: self
+                    .metrics
+                    .inline_fast_refresh_completed
+                    .load(Ordering::Relaxed),
                 prefetch_requests: self.metrics.prefetch_requests.load(Ordering::Relaxed),
                 status_requests: self.metrics.status_requests.load(Ordering::Relaxed),
                 shutdown_requests: self.metrics.shutdown_requests.load(Ordering::Relaxed),
@@ -182,6 +235,10 @@ impl DaemonState {
 struct DaemonMetrics {
     total_requests: AtomicU64,
     complete_requests: AtomicU64,
+    inline_fast_requests: AtomicU64,
+    inline_fast_cache_hits: AtomicU64,
+    inline_fast_refresh_queued: AtomicU64,
+    inline_fast_refresh_completed: AtomicU64,
     prefetch_requests: AtomicU64,
     status_requests: AtomicU64,
     shutdown_requests: AtomicU64,

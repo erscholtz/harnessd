@@ -70,6 +70,12 @@ pub enum Commands {
         /// User instruction for generated insertion text.
         #[arg(long)]
         prompt: String,
+        /// Optional model override for this request.
+        #[arg(long)]
+        model: Option<String>,
+        /// Optional reasoning effort override for this request.
+        #[arg(long)]
+        reasoning_effort: Option<String>,
     },
 
     /// Generate a saved scratch preview file from live-buffer context.
@@ -92,6 +98,12 @@ pub enum Commands {
         /// Optional selected end byte.
         #[arg(long)]
         selection_end: Option<usize>,
+        /// Optional model override for this request.
+        #[arg(long)]
+        model: Option<String>,
+        /// Optional reasoning effort override for this request.
+        #[arg(long)]
+        reasoning_effort: Option<String>,
     },
 
     /// Warm the proposal cache for a file or workspace path.
@@ -147,6 +159,15 @@ pub enum Commands {
         #[arg(long)]
         /// Optional cursor payload.
         cursor: Option<String>,
+        #[arg(long)]
+        /// Optional model override for bridge methods that support models.
+        model: Option<String>,
+        #[arg(long)]
+        /// Optional reasoning effort override for bridge methods that support models.
+        reasoning_effort: Option<String>,
+        /// Disable background model refresh for bridge methods that support it.
+        #[arg(long)]
+        no_background_refresh: bool,
     },
 }
 
@@ -173,6 +194,12 @@ pub enum ThreadCommands {
         /// Optional selected end byte.
         #[arg(long)]
         selection_end: Option<usize>,
+        /// Optional model override for the launched Codex thread.
+        #[arg(long)]
+        model: Option<String>,
+        /// Optional reasoning effort override for the launched Codex thread.
+        #[arg(long)]
+        reasoning_effort: Option<String>,
     },
     /// List anchored threads; optional live buffer content is read from stdin when provided.
     List {

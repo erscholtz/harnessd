@@ -7,7 +7,7 @@ use std::time::Duration;
 use harnessd::acp::AcpClient;
 use harnessd::ipc;
 use harnessd::rpc::{
-    AnchorsParams, CompleteParams, GenerateParams, InlineParams, PrefetchParams,
+    AnchorsParams, CompleteParams, GenerateParams, InlineFastParams, InlineParams, PrefetchParams,
     ScratchCreateParams, ThreadCreateParams, ThreadLinkParams, ThreadListParams,
 };
 use harnessd::scratch::ScratchClient;
@@ -134,6 +134,43 @@ async fn prefetch_populates_cache_for_python_complete() {
 }
 
 #[tokio::test]
+async fn complete_still_reads_saved_file() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).expect("failed to create runtime dir");
+
+    let file_path = runtime_dir.join("fixture.rs");
+    let source = "fn demo() {\n    todo!();\n    let saved_value = 1;\n}\n";
+    std::fs::write(&file_path, source).expect("failed to write fixture");
+
+    let state = DaemonState::new(runtime_dir.clone()).expect("failed to create daemon state");
+    let prefetch = ipc::prefetch(
+        &state,
+        &PrefetchParams {
+            path: file_path.to_string_lossy().to_string(),
+        },
+    )
+    .await
+    .expect("prefetch failed");
+    assert_eq!(prefetch.proposals_stored, 1);
+
+    let suggestions = ipc::complete(
+        &state,
+        &CompleteParams {
+            file: file_path.to_string_lossy().to_string(),
+            offset: source.find("saved_value").unwrap(),
+            prefix: None,
+        },
+    )
+    .await
+    .expect("complete failed");
+
+    assert_eq!(suggestions.len(), 1);
+    assert_eq!(suggestions[0].label, "Replace todo!()");
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[tokio::test]
 async fn status_reports_cache_and_request_metrics() {
     let runtime_dir = temp_runtime_dir();
     std::fs::create_dir_all(&runtime_dir).expect("failed to create runtime dir");
@@ -190,12 +227,23 @@ async fn thread_rpc_helpers_create_list_and_link() {
             prompt: "explain value".to_string(),
             selection_start: None,
             selection_end: None,
+            model: Some("gpt-5.5".to_string()),
+            reasoning_effort: Some("high".to_string()),
         },
     )
     .await
     .expect("thread create failed");
     assert_eq!(created.thread.current_line, 2);
+    assert_eq!(created.thread.model.as_deref(), Some("gpt-5.5"));
     assert_eq!(created.launch.argv[0], "codex");
+    assert!(
+        created
+            .launch
+            .argv
+            .windows(2)
+            .any(|args| args == ["--model", "gpt-5.5"])
+    );
+    assert_eq!(created.launch.model.as_deref(), Some("gpt-5.5"));
 
     let linked = ipc::thread_link(
         &state,
@@ -262,18 +310,23 @@ async fn anchors_report_supported_anchor_kinds_and_candidate_state() {
 async fn generate_via_acp_is_bounded_cached_and_deduplicated() {
     let runtime_dir = temp_runtime_dir();
     std::fs::create_dir_all(&runtime_dir).unwrap();
+    let args_log = runtime_dir.join("acp-generate-args.txt");
     let agent = fake_acp(
         &runtime_dir,
-        r##"#!/bin/sh
+        &format!(
+            r##"#!/bin/sh
+printf '%s\n' "$@" > "{args_log}"
 read -r ignored
-printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1}}}}'
 read -r ignored
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"fake"}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"fake"}}}}'
 read -r ignored
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"```rust\nlet value = "}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"42;\n```"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"fake","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"```rust\nlet value = "}}}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"fake","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"42;\n```"}}}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
 "##,
+            args_log = args_log.display(),
+        ),
     );
     let file_path = runtime_dir.join("fixture.rs");
     let source = "fn demo() {\n    // TODO: value\n}\n";
@@ -288,6 +341,11 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
     let second = ipc::generate(&state, &params).await.unwrap();
     assert_eq!(first.insert_text, "let value = 42;");
     assert_eq!(second.insert_text, first.insert_text);
+    assert!(
+        std::fs::read_to_string(args_log)
+            .unwrap()
+            .contains("model_reasoning_effort=\"high\"")
+    );
     assert_eq!(state.cache.stats().await.unwrap().total_proposals, 1);
     let anchors = ipc::anchors(
         &state,
@@ -448,21 +506,26 @@ while :; do :; done
 async fn inline_uses_live_buffer_content_without_caching() {
     let runtime_dir = temp_runtime_dir();
     std::fs::create_dir_all(&runtime_dir).unwrap();
+    let args_log = runtime_dir.join("acp-inline-args.txt");
     let agent = fake_acp(
         &runtime_dir,
-        r##"#!/bin/sh
+        &format!(
+            r##"#!/bin/sh
+printf '%s\n' "$@" > "{args_log}"
 read -r ignored
-printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1}}}}'
 read -r ignored
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"fake"}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"fake"}}}}'
 read -r prompt
 case "$prompt" in
   *HARNESSD_CURSOR*unsaved_value*) ;;
   *) exit 7 ;;
 esac
-printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"let inserted = true;"}}}}'
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"fake","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"let inserted = true;"}}}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
 "##,
+            args_log = args_log.display(),
+        ),
     );
     let file_path = runtime_dir.join("fixture.rs");
     std::fs::write(&file_path, "fn saved() {}\n").unwrap();
@@ -476,14 +539,403 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
             offset: content.find("unsaved_value").unwrap(),
             content: content.to_string(),
             prompt: "insert handling".to_string(),
+            model: Some("gpt-5.4-mini".to_string()),
+            reasoning_effort: Some("low".to_string()),
         },
     )
     .await
     .unwrap();
     assert_eq!(suggestion.label, "Inline ask");
     assert_eq!(suggestion.insert_text, "let inserted = true;");
+    assert!(
+        std::fs::read_to_string(&args_log)
+            .unwrap()
+            .contains("model_reasoning_effort=\"low\"")
+    );
+    assert!(
+        std::fs::read_to_string(args_log)
+            .unwrap()
+            .contains("model=\"gpt-5.4-mini\"")
+    );
     assert_eq!(state.cache.stats().await.unwrap().total_proposals, 0);
 
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[tokio::test]
+async fn inline_fast_returns_cached_live_buffer_suggestion() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let file_path = runtime_dir.join("fixture.rs");
+    let source = "fn demo() {\n    todo!();\n    let value = 1;\n}\n";
+    std::fs::write(&file_path, source).unwrap();
+    let state = DaemonState::new(runtime_dir.clone()).unwrap();
+    let file = file_path.to_string_lossy().to_string();
+    let anchor_start = source.find("todo!").unwrap();
+    let anchor_end = source[anchor_start..].find(')').unwrap() + anchor_start + 1;
+    state
+        .cache
+        .store(
+            &file,
+            anchor_start,
+            anchor_end,
+            &harnessd::cache::compute_hash(source.trim_end()),
+            "let cached = value + 1;",
+            "Cached live",
+        )
+        .await
+        .unwrap();
+
+    let result = ipc::inline_fast(
+        &state,
+        &InlineFastParams {
+            file,
+            offset: source.find("value").unwrap(),
+            content: source.to_string(),
+            prefix: None,
+            prompt: None,
+            model: None,
+            reasoning_effort: None,
+            allow_background_refresh: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.source, "anchor-cache");
+    assert!(!result.refresh_queued);
+    assert_eq!(
+        result.suggestion.unwrap().insert_text,
+        "let cached = value + 1;"
+    );
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[tokio::test]
+async fn inline_fast_does_not_require_saved_file_content() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let file_path = runtime_dir.join("fixture.rs");
+    std::fs::write(&file_path, "fn saved() {}\n").unwrap();
+    let live = "fn demo() {\n    todo!();\n    let unsaved_value = 1;\n}\n";
+    let state = DaemonState::new(runtime_dir.clone()).unwrap();
+    let file = file_path.to_string_lossy().to_string();
+    let anchor_start = live.find("todo!").unwrap();
+    let anchor_end = live[anchor_start..].find(')').unwrap() + anchor_start + 1;
+    state
+        .cache
+        .store(
+            &file,
+            anchor_start,
+            anchor_end,
+            &harnessd::cache::compute_hash(live.trim_end()),
+            "let cached = unsaved_value + 1;",
+            "Cached unsaved",
+        )
+        .await
+        .unwrap();
+
+    let result = ipc::inline_fast(
+        &state,
+        &InlineFastParams {
+            file,
+            offset: live.find("unsaved_value").unwrap(),
+            content: live.to_string(),
+            prefix: None,
+            prompt: None,
+            model: None,
+            reasoning_effort: None,
+            allow_background_refresh: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.suggestion.unwrap().insert_text,
+        "let cached = unsaved_value + 1;"
+    );
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[tokio::test]
+async fn inline_fast_returns_none_on_no_cache_hit() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let file_path = runtime_dir.join("fixture.rs");
+    let source = "fn demo() {\n    let value = 1;\n}\n";
+    std::fs::write(&file_path, source).unwrap();
+    let state = DaemonState::new(runtime_dir.clone()).unwrap();
+
+    let result = ipc::inline_fast(
+        &state,
+        &InlineFastParams {
+            file: file_path.to_string_lossy().to_string(),
+            offset: source.find("value").unwrap(),
+            content: source.to_string(),
+            prefix: None,
+            prompt: None,
+            model: None,
+            reasoning_effort: None,
+            allow_background_refresh: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.source, "none");
+    assert!(result.suggestion.is_none());
+    assert!(!result.refresh_queued);
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[tokio::test]
+async fn inline_fast_does_not_generate_todo_stub() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let file_path = runtime_dir.join("fixture.rs");
+    let source = "fn demo() {\n    todo!();\n}\n";
+    std::fs::write(&file_path, source).unwrap();
+    let state = DaemonState::new(runtime_dir.clone()).unwrap();
+
+    let result = ipc::inline_fast(
+        &state,
+        &InlineFastParams {
+            file: file_path.to_string_lossy().to_string(),
+            offset: source.find("todo").unwrap(),
+            content: source.to_string(),
+            prefix: None,
+            prompt: None,
+            model: None,
+            reasoning_effort: None,
+            allow_background_refresh: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.source, "none");
+    assert!(result.suggestion.is_none());
+    assert!(!result.refresh_queued);
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inline_fast_queues_single_refresh_per_key() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let agent = fake_acp(
+        &runtime_dir,
+        r##"#!/bin/sh
+while :; do sleep 1; done
+"##,
+    );
+    let file_path = runtime_dir.join("fixture.rs");
+    let source = "fn demo() {\n    let value = 1;\n}\n";
+    std::fs::write(&file_path, source).unwrap();
+    let state = DaemonState::new_with_acp(
+        runtime_dir.clone(),
+        AcpClient::with_timeout(agent, Duration::from_millis(200)),
+    )
+    .unwrap();
+
+    let params = InlineFastParams {
+        file: file_path.to_string_lossy().to_string(),
+        offset: source.find("value").unwrap(),
+        content: source.to_string(),
+        prefix: None,
+        prompt: Some("complete it".to_string()),
+        model: None,
+        reasoning_effort: None,
+        allow_background_refresh: true,
+    };
+    let first = ipc::inline_fast(&state, &params).await.unwrap();
+    let second = ipc::inline_fast(&state, &params).await.unwrap();
+
+    assert!(first.refresh_queued);
+    assert!(!second.refresh_queued);
+    assert_eq!(state.active_inline_refresh_jobs().await, 1);
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inline_reuses_acp_session_for_same_workspace() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let launch_log = runtime_dir.join("acp-launches.txt");
+    let agent = fake_acp(
+        &runtime_dir,
+        &format!(
+            r##"#!/bin/sh
+printf 'launch\n' >> "{launch_log}"
+read -r ignored
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1}}}}'
+read -r ignored
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"fake"}}}}'
+read -r prompt
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"fake","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"first();"}}}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
+read -r prompt
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"fake","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"second();"}}}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
+"##,
+            launch_log = launch_log.display(),
+        ),
+    );
+    let file_path = runtime_dir.join("fixture.rs");
+    std::fs::write(&file_path, "fn saved() {}\n").unwrap();
+    let content = "fn demo() {\n    \n}\n";
+    let state = DaemonState::new_with_acp(runtime_dir.clone(), AcpClient::new(agent)).unwrap();
+
+    let first = ipc::inline(
+        &state,
+        &InlineParams {
+            file: file_path.to_string_lossy().to_string(),
+            offset: content.find('\n').unwrap() + 1,
+            content: content.to_string(),
+            prompt: "insert first call".to_string(),
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    let second = ipc::inline(
+        &state,
+        &InlineParams {
+            file: file_path.to_string_lossy().to_string(),
+            offset: content.find('\n').unwrap() + 1,
+            content: content.to_string(),
+            prompt: "insert second call".to_string(),
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(first.insert_text, "first();");
+    assert_eq!(second.insert_text, "second();");
+    assert_eq!(std::fs::read_to_string(launch_log).unwrap(), "launch\n");
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inline_uses_separate_acp_sessions_for_different_models() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let args_log = runtime_dir.join("acp-model-launches.txt");
+    let agent = fake_acp(
+        &runtime_dir,
+        &format!(
+            r##"#!/bin/sh
+printf '%s\n' "$@" >> "{args_log}"
+printf '%s\n' '--' >> "{args_log}"
+read -r ignored
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1}}}}'
+read -r ignored
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"fake"}}}}'
+read -r prompt
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"fake","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"model_call();"}}}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
+"##,
+            args_log = args_log.display(),
+        ),
+    );
+    let file_path = runtime_dir.join("fixture.rs");
+    std::fs::write(&file_path, "fn saved() {}\n").unwrap();
+    let content = "fn demo() {\n    \n}\n";
+    let state = DaemonState::new_with_acp(runtime_dir.clone(), AcpClient::new(agent)).unwrap();
+
+    for model in ["gpt-5.4-mini", "gpt-5.5"] {
+        let suggestion = ipc::inline(
+            &state,
+            &InlineParams {
+                file: file_path.to_string_lossy().to_string(),
+                offset: content.find('\n').unwrap() + 1,
+                content: content.to_string(),
+                prompt: "insert call".to_string(),
+                model: Some(model.to_string()),
+                reasoning_effort: Some("low".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(suggestion.insert_text, "model_call();");
+    }
+
+    let args = std::fs::read_to_string(args_log).unwrap();
+    assert!(args.contains("model=\"gpt-5.4-mini\""));
+    assert!(args.contains("model=\"gpt-5.5\""));
+    assert_eq!(args.matches("--").count(), 2);
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inline_prepare_warms_acp_session_for_next_inline() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let launch_log = runtime_dir.join("acp-prepare-launches.txt");
+    let agent = fake_acp(
+        &runtime_dir,
+        &format!(
+            r##"#!/bin/sh
+printf 'launch\n' >> "{launch_log}"
+read -r ignored
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1}}}}'
+read -r ignored
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"sessionId":"fake"}}}}'
+read -r prompt
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"fake","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"prepared();"}}}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"end_turn"}}}}'
+"##,
+            launch_log = launch_log.display(),
+        ),
+    );
+    let file_path = runtime_dir.join("fixture.rs");
+    std::fs::write(&file_path, "fn saved() {}\n").unwrap();
+    let state = DaemonState::new_with_acp(runtime_dir.clone(), AcpClient::new(agent)).unwrap();
+
+    let prepared = ipc::inline_prepare(
+        &state,
+        &harnessd::rpc::InlinePrepareParams {
+            file: file_path.to_string_lossy().to_string(),
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    let suggestion = ipc::inline(
+        &state,
+        &InlineParams {
+            file: file_path.to_string_lossy().to_string(),
+            offset: 0,
+            content: "fn demo() {}\n".to_string(),
+            prompt: "insert call".to_string(),
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(prepared.prepared);
+    assert_eq!(suggestion.insert_text, "prepared();");
+    assert_eq!(std::fs::read_to_string(launch_log).unwrap(), "launch\n");
+
+    state.acp.shutdown().await;
     std::fs::remove_dir_all(&runtime_dir).ok();
 }
 
@@ -501,18 +953,24 @@ async fn inline_validates_prompt_and_cursor_before_generation() {
             offset: 0,
             content: "fn x() {}".to_string(),
             prompt: "  ".to_string(),
+            model: None,
+            reasoning_effort: None,
         },
         InlineParams {
             file: file_path.to_string_lossy().to_string(),
             offset: 99,
             content: "fn x() {}".to_string(),
             prompt: "ask".to_string(),
+            model: None,
+            reasoning_effort: None,
         },
         InlineParams {
             file: file_path.to_string_lossy().to_string(),
             offset: 1,
             content: "é".to_string(),
             prompt: "ask".to_string(),
+            model: None,
+            reasoning_effort: None,
         },
     ] {
         assert!(ipc::inline(&state, &params).await.is_err());
@@ -549,6 +1007,8 @@ read -r denied
             offset: 10,
             content: "fn demo() {}\n".to_string(),
             prompt: "fill it".to_string(),
+            model: None,
+            reasoning_effort: None,
         },
     )
     .await
@@ -609,12 +1069,15 @@ printf '%s\n' '{{"title":"Usage sketch","body":"fn main() {{\n    println!(\"scr
             prompt: "sketch usage".to_string(),
             selection_start: None,
             selection_end: None,
+            model: Some("gpt-5.4-mini".to_string()),
+            reasoning_effort: Some("low".to_string()),
         },
     )
     .await
     .unwrap();
 
     let args = std::fs::read_to_string(args_log).unwrap();
+    assert!(args.contains("--model\ngpt-5.4-mini"));
     assert!(args.contains("--ask-for-approval\nnever"));
     assert!(args.contains("--sandbox\nread-only"));
     assert!(args.contains("--cd\n"));
@@ -664,6 +1127,8 @@ printf '%s\n' 'not json' > "$out"
         prompt: "sketch usage".to_string(),
         selection_start: None,
         selection_end: None,
+        model: None,
+        reasoning_effort: None,
     };
     let state = DaemonState::new_with_clients(
         runtime_dir.clone(),
@@ -739,6 +1204,8 @@ printf '%s\n' '{"title":"Demo","body":"fn main() {}"}' > "$out"
         prompt: "same prompt".to_string(),
         selection_start: None,
         selection_end: None,
+        model: None,
+        reasoning_effort: None,
     };
 
     let first = ipc::scratch_create(&state, &params).await.unwrap();

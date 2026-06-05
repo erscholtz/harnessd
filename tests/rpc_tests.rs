@@ -2,8 +2,9 @@
 
 use harnessd::rpc::{
     AnchorsParams, CacheStatus, CodexSessionsParams, CompleteParams, DaemonMetricsSnapshot,
-    GenerateParams, InlineParams, JsonRpcRequest, JsonRpcResponse, PrefetchParams, RecentProposal,
-    ScratchCreateParams, ScratchCreateResult, StatusResult, ThreadCreateParams, ThreadListParams,
+    GenerateParams, InlineParams, InlinePrepareParams, InlinePrepareResult, JsonRpcRequest,
+    JsonRpcResponse, PrefetchParams, RecentProposal, ScratchCreateParams, ScratchCreateResult,
+    StatusResult, ThreadCreateParams, ThreadListParams,
 };
 
 #[test]
@@ -106,6 +107,8 @@ fn test_inline_params_roundtrip() {
         offset: 12,
         content: "fn unsaved() {}".to_string(),
         prompt: "insert validation".to_string(),
+        model: Some("gpt-5.4-mini".to_string()),
+        reasoning_effort: Some("low".to_string()),
     };
     let json = serde_json::to_string(&params).expect("failed to serialize inline params");
     let decoded: InlineParams =
@@ -114,6 +117,29 @@ fn test_inline_params_roundtrip() {
     assert_eq!(decoded.offset, params.offset);
     assert_eq!(decoded.content, params.content);
     assert_eq!(decoded.prompt, params.prompt);
+    assert_eq!(decoded.model.as_deref(), Some("gpt-5.4-mini"));
+    assert_eq!(decoded.reasoning_effort.as_deref(), Some("low"));
+}
+
+#[test]
+fn test_inline_prepare_params_and_result_roundtrip() {
+    let params = InlinePrepareParams {
+        file: "/test/file.rs".to_string(),
+        model: Some("gpt-5.4-mini".to_string()),
+        reasoning_effort: Some("low".to_string()),
+    };
+    let json = serde_json::to_string(&params).expect("failed to serialize inline prepare params");
+    let decoded: InlinePrepareParams =
+        serde_json::from_str(&json).expect("failed to deserialize inline prepare params");
+    assert_eq!(decoded.file, params.file);
+    assert_eq!(decoded.model.as_deref(), Some("gpt-5.4-mini"));
+    assert_eq!(decoded.reasoning_effort.as_deref(), Some("low"));
+
+    let result = InlinePrepareResult { prepared: true };
+    let json = serde_json::to_string(&result).expect("failed to serialize inline prepare result");
+    let decoded: InlinePrepareResult =
+        serde_json::from_str(&json).expect("failed to deserialize inline prepare result");
+    assert!(decoded.prepared);
 }
 
 #[test]
@@ -126,6 +152,8 @@ fn test_scratch_params_and_result_roundtrip() {
         prompt: "sketch usage".to_string(),
         selection_start: Some(1),
         selection_end: Some(5),
+        model: Some("gpt-5.4-mini".to_string()),
+        reasoning_effort: Some("low".to_string()),
     };
     let json = serde_json::to_string(&params).expect("failed to serialize scratch params");
     let decoded: ScratchCreateParams =
@@ -137,6 +165,8 @@ fn test_scratch_params_and_result_roundtrip() {
     assert_eq!(decoded.prompt, params.prompt);
     assert_eq!(decoded.selection_start, Some(1));
     assert_eq!(decoded.selection_end, Some(5));
+    assert_eq!(decoded.model.as_deref(), Some("gpt-5.4-mini"));
+    assert_eq!(decoded.reasoning_effort.as_deref(), Some("low"));
 
     let result = ScratchCreateResult {
         path: "/workspace/scratch/harnessd/demo.rs".to_string(),
@@ -179,12 +209,16 @@ fn test_thread_params_roundtrip() {
         prompt: "ask".to_string(),
         selection_start: Some(1),
         selection_end: Some(5),
+        model: Some("gpt-5.5".to_string()),
+        reasoning_effort: Some("high".to_string()),
     };
     let json = serde_json::to_string(&create).expect("failed to serialize thread create");
     let decoded: ThreadCreateParams =
         serde_json::from_str(&json).expect("failed to deserialize thread create");
     assert_eq!(decoded.offset, 12);
     assert_eq!(decoded.selection_start, Some(1));
+    assert_eq!(decoded.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(decoded.reasoning_effort.as_deref(), Some("high"));
 
     let list: ThreadListParams =
         serde_json::from_str(r#"{"workspace":"/workspace","file":"/workspace/src/main.rs"}"#)
@@ -313,6 +347,10 @@ fn test_status_result_serialization() {
         metrics: DaemonMetricsSnapshot {
             total_requests: 3,
             complete_requests: 1,
+            inline_fast_requests: 0,
+            inline_fast_cache_hits: 0,
+            inline_fast_refresh_queued: 0,
+            inline_fast_refresh_completed: 0,
             prefetch_requests: 1,
             status_requests: 1,
             shutdown_requests: 0,
