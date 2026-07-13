@@ -10,10 +10,12 @@ use tokio::sync::RwLock;
 
 use crate::acp::AcpClient;
 use crate::cache::ProposalCache;
+use crate::marks::MarkStore;
 use crate::parser::LanguageParsers;
 use crate::rpc::{CacheStatus, DaemonMetricsSnapshot, RecentProposal, StatusResult};
 use crate::runtime;
 use crate::scratch::ScratchClient;
+use crate::settings::SettingsStore;
 use crate::threads::ThreadStore;
 
 /// Shared state for the daemon, accessible from RPC handlers.
@@ -26,8 +28,12 @@ pub struct DaemonState {
     pub acp: AcpClient,
     /// Codex process launcher used for saved scratch preview artifacts.
     pub scratch: ScratchClient,
+    /// Persistent external source marks.
+    pub marks: MarkStore,
     /// Persistent Neovim line-thread anchors.
     pub threads: ThreadStore,
+    /// Daemon-owned settings.
+    pub settings: SettingsStore,
     /// Runtime directory for sockets, etc.
     pub runtime_dir: PathBuf,
     cache_db_path: PathBuf,
@@ -70,7 +76,9 @@ impl DaemonState {
             parser: RwLock::new(parser),
             acp,
             scratch,
+            marks: MarkStore::new(crate::marks::store_path(&runtime_dir)),
             threads: ThreadStore::new(crate::threads::store_path(&runtime_dir)),
+            settings: SettingsStore::new(runtime_dir.join("settings.json")),
             runtime_dir,
             cache_db_path: cache_path,
             started_at: Instant::now(),

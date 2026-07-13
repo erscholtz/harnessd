@@ -13,6 +13,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, Command};
 
 use crate::rpc::{ScratchCreateParams, ScratchCreateResult};
+use crate::settings::ScratchStorageMode;
 
 const CONTEXT_MAX_BYTES: usize = 16 * 1024;
 const PROMPT_PREVIEW_MAX_CHARS: usize = 120;
@@ -20,6 +21,34 @@ const SLUG_MAX_CHARS: usize = 48;
 const MAX_LINES: usize = 400;
 const MAX_BYTES: usize = 64 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
+const STANDALONE_SCRATCH_DIR: &str = "standalone";
+
+/// Scratch artifact write target.
+#[derive(Debug, Clone)]
+pub struct ScratchWriteOptions {
+    /// Scratch storage mode selected by daemon settings.
+    pub storage_mode: ScratchStorageMode,
+    /// Optional owning thread id.
+    pub thread_id: Option<String>,
+}
+
+impl ScratchWriteOptions {
+    /// Runtime storage without a thread owner.
+    pub fn runtime() -> Self {
+        Self {
+            storage_mode: ScratchStorageMode::Runtime,
+            thread_id: None,
+        }
+    }
+
+    /// Create write options from settings and an optional thread id.
+    pub fn new(storage_mode: ScratchStorageMode, thread_id: Option<String>) -> Self {
+        Self {
+            storage_mode,
+            thread_id,
+        }
+    }
+}
 
 /// Process-based scratch generator.
 #[derive(Debug, Clone)]
@@ -68,10 +97,20 @@ impl ScratchClient {
         &self,
         params: &ScratchCreateParams,
     ) -> anyhow::Result<ScratchCreateResult> {
+        self.create_with_options(params, &ScratchWriteOptions::runtime())
+            .await
+    }
+
+    /// Generate one scratch artifact for an explicit storage target.
+    pub async fn create_with_options(
+        &self,
+        params: &ScratchCreateParams,
+        options: &ScratchWriteOptions,
+    ) -> anyhow::Result<ScratchCreateResult> {
         validate_params(params)?;
         let prompt = scratch_prompt(params);
         let generated = self.run_codex(params, &prompt).await?;
-        let artifact = build_artifact(params, &generated)?;
+        let artifact = self.build_artifact(params, &generated, options)?;
         write_artifact(params, &artifact)
     }
 
@@ -109,7 +148,7 @@ impl ScratchClient {
             .arg("read-only")
             .arg("exec")
             .arg("--cd")
-            .arg(&params.workspace)
+            .arg(&self.runtime_dir)
             .arg("--output-schema")
             .arg(&schema_path)
             .arg("--output-last-message")
@@ -165,8 +204,9 @@ impl ScratchClient {
 pub async fn create(
     client: &ScratchClient,
     params: &ScratchCreateParams,
+    options: &ScratchWriteOptions,
 ) -> anyhow::Result<ScratchCreateResult> {
-    client.create(params).await
+    client.create_with_options(params, options).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,9 +288,10 @@ fn scratch_prompt(params: &ScratchCreateParams) -> String {
          Source file: {file}\n\
          Cursor line: {line}\n\
          User request: {ask}\n\n\
-         You may inspect the repository for context, but you must not edit files, run write commands, \
-         or rely on network access. Return only JSON matching the provided schema. The `body` field \
-         must be the complete contents of one useful preview/MVP/example file, with no markdown fences.\n\n\
+         Use only the context included in this prompt unless the user explicitly requested more. \
+         Do not inspect the repository, edit files, run write commands, or rely on network access. \
+         Return only JSON matching the provided schema. The `body` field must be the complete \
+         contents of one useful preview/MVP/example file, with no markdown fences.\n\n\
          {context}\n",
         workspace = params.workspace,
         file = params.file,
@@ -260,42 +301,54 @@ fn scratch_prompt(params: &ScratchCreateParams) -> String {
     )
 }
 
-fn build_artifact(
-    params: &ScratchCreateParams,
-    generated: &GeneratedScratch,
-) -> anyhow::Result<Artifact> {
-    let mut body = generated.body.trim().to_string();
-    if body.starts_with("```")
-        && body.ends_with("```")
-        && let Some(first_newline) = body.find('\n')
-    {
-        body = body[first_newline + 1..body.len() - 3].trim().to_string();
+impl ScratchClient {
+    fn build_artifact(
+        &self,
+        params: &ScratchCreateParams,
+        generated: &GeneratedScratch,
+        options: &ScratchWriteOptions,
+    ) -> anyhow::Result<Artifact> {
+        let mut body = generated.body.trim().to_string();
+        if body.starts_with("```")
+            && body.ends_with("```")
+            && let Some(first_newline) = body.find('\n')
+        {
+            body = body[first_newline + 1..body.len() - 3].trim().to_string();
+        }
+
+        let header = header_for(params, &generated.title);
+        let text = format!("{header}{body}\n");
+        enforce_caps(&text)?;
+
+        let scratch_dir = thread_scratch_dir(
+            &self.runtime_dir,
+            options.storage_mode,
+            Path::new(&params.workspace),
+            options.thread_id.as_deref(),
+        );
+        let extension = Path::new(&params.file)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .filter(|extension| !extension.is_empty())
+            .unwrap_or("md");
+        let basename = format!(
+            "{}-{}",
+            timestamp_for_filename(unix_timestamp()),
+            slug(&params.prompt)
+        );
+        let path = unique_path(&scratch_dir, &basename, extension);
+        let display_root = display_root(&self.runtime_dir, options.storage_mode);
+        let relative_path = path
+            .strip_prefix(&display_root)
+            .unwrap_or(&path)
+            .to_path_buf();
+
+        Ok(Artifact {
+            path,
+            relative_path,
+            text,
+        })
     }
-
-    let header = header_for(params, &generated.title);
-    let text = format!("{header}{body}\n");
-    enforce_caps(&text)?;
-
-    let workspace = Path::new(&params.workspace);
-    let scratch_dir = workspace.join("scratch").join("harnessd");
-    let extension = Path::new(&params.file)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .filter(|extension| !extension.is_empty())
-        .unwrap_or("md");
-    let basename = format!(
-        "{}-{}",
-        timestamp_for_filename(unix_timestamp()),
-        slug(&params.prompt)
-    );
-    let path = unique_path(&scratch_dir, &basename, extension);
-    let relative_path = path.strip_prefix(workspace).unwrap_or(&path).to_path_buf();
-
-    Ok(Artifact {
-        path,
-        relative_path,
-        text,
-    })
 }
 
 fn write_artifact(
@@ -329,6 +382,115 @@ fn write_artifact(
         "scratch preview written"
     );
     Ok(result)
+}
+
+/// Return the scratch base directory for a storage mode.
+pub fn scratch_base_dir(runtime_dir: &Path, storage_mode: ScratchStorageMode) -> PathBuf {
+    match storage_mode {
+        ScratchStorageMode::Runtime => runtime_dir.join("scratch"),
+        ScratchStorageMode::Temp => std::env::temp_dir().join("harnessd").join("scratch"),
+    }
+}
+
+/// Return the scratch directory for one workspace and optional thread.
+pub fn thread_scratch_dir(
+    runtime_dir: &Path,
+    storage_mode: ScratchStorageMode,
+    workspace: &Path,
+    thread_id: Option<&str>,
+) -> PathBuf {
+    scratch_base_dir(runtime_dir, storage_mode)
+        .join(workspace_hash(workspace))
+        .join(sanitize_component(
+            thread_id.unwrap_or(STANDALONE_SCRATCH_DIR),
+        ))
+}
+
+/// Remove scratch files for a thread, guarding against arbitrary recursive deletion.
+pub fn delete_thread_scratch_dir(
+    runtime_dir: &Path,
+    storage_mode: ScratchStorageMode,
+    workspace: &Path,
+    thread_id: &str,
+) -> anyhow::Result<bool> {
+    let base = scratch_base_dir(runtime_dir, storage_mode);
+    let dir = thread_scratch_dir(runtime_dir, storage_mode, workspace, Some(thread_id));
+    if !dir.starts_with(&base) {
+        anyhow::bail!(
+            "refusing to delete scratch path outside configured root: {}",
+            dir.display()
+        );
+    }
+    if !dir.exists() {
+        return Ok(false);
+    }
+    std::fs::remove_dir_all(&dir)
+        .with_context(|| format!("failed to remove scratch dir {}", dir.display()))?;
+    Ok(true)
+}
+
+/// Delete the parent scratch directory for an artifact path when it is under a
+/// configured harnessd scratch root.
+pub fn delete_artifact_scratch_dir(
+    runtime_dir: &Path,
+    artifact_path: &Path,
+) -> anyhow::Result<bool> {
+    let Some(dir) = artifact_path.parent() else {
+        return Ok(false);
+    };
+    let runtime_base = scratch_base_dir(runtime_dir, ScratchStorageMode::Runtime);
+    let temp_base = scratch_base_dir(runtime_dir, ScratchStorageMode::Temp);
+    if !dir.starts_with(&runtime_base) && !dir.starts_with(&temp_base) {
+        return Ok(false);
+    }
+    if !dir.exists() {
+        return Ok(false);
+    }
+    std::fs::remove_dir_all(dir)
+        .with_context(|| format!("failed to remove scratch dir {}", dir.display()))?;
+    Ok(true)
+}
+
+fn display_root(runtime_dir: &Path, storage_mode: ScratchStorageMode) -> PathBuf {
+    match storage_mode {
+        ScratchStorageMode::Runtime => runtime_dir.to_path_buf(),
+        ScratchStorageMode::Temp => std::env::temp_dir().join("harnessd"),
+    }
+}
+
+fn workspace_hash(workspace: &Path) -> String {
+    let normalized = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    stable_hash(&normalized.to_string_lossy())
+}
+
+fn stable_hash(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn sanitize_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches('-');
+    if trimmed.is_empty() {
+        STANDALONE_SCRATCH_DIR.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn enforce_caps(text: &str) -> anyhow::Result<()> {

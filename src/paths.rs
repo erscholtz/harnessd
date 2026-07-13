@@ -35,6 +35,16 @@ pub fn threads_path() -> PathBuf {
     runtime_dir().join("threads.json")
 }
 
+/// Persistent external source marks.
+pub fn marks_path() -> PathBuf {
+    runtime_dir().join("marks.json")
+}
+
+/// Persistent daemon settings.
+pub fn settings_path() -> PathBuf {
+    runtime_dir().join("settings.json")
+}
+
 #[cfg(windows)]
 fn runtime_root() -> PathBuf {
     dirs::data_local_dir()

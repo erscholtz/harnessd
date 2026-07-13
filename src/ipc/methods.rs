@@ -13,10 +13,12 @@ use crate::parser::{Anchor, AnchorKind, LanguageParsers, ParsedFile, SupportedLa
 use crate::rpc::{
     AnchorInfo, AnchorsParams, CodexSessionsParams, CompleteParams, CompletionSuggestion,
     GenerateParams, InlineFastParams, InlineParams, InlinePrepareParams, JsonRpcRequest,
-    JsonRpcResponse, PrefetchParams, PrefetchResult, ScratchCreateParams, StatusResult,
-    ThreadAttachParams, ThreadCreateParams, ThreadLinkParams, ThreadListParams,
-    ThreadResolveParams,
+    JsonRpcResponse, MarkCreateParams, MarkDeleteParams, MarkListParams, MarkStepParams,
+    PrefetchParams, PrefetchResult, ScratchCreateParams, SettingsUpdateParams, StatusResult,
+    ThreadAttachParams, ThreadCreateParams, ThreadDeleteParams, ThreadExampleCreateParams,
+    ThreadLinkParams, ThreadListParams, ThreadResolveParams,
 };
+use crate::scratch::ScratchWriteOptions;
 use crate::state::DaemonState;
 
 /// Start the IPC server and listen for JSON-RPC connections.
@@ -173,12 +175,21 @@ async fn process_request(
         "inline.fast" => handle_inline_fast(request, state).await,
         "inline.prepare" => handle_inline_prepare(request, state).await,
         "scratch.create" => handle_scratch_create(request, state).await,
+        "mark.create" => handle_mark_create(request, state).await,
+        "mark.list" => handle_mark_list(request, state).await,
+        "mark.delete" => handle_mark_delete(request, state).await,
+        "mark.next" => handle_mark_next(request, state).await,
+        "mark.prev" => handle_mark_prev(request, state).await,
+        "settings.get" => handle_settings_get(request, state).await,
+        "settings.update" => handle_settings_update(request, state).await,
         "codex.sessions" => handle_codex_sessions(request).await,
         "thread.create" => handle_thread_create(request, state).await,
         "thread.list" => handle_thread_list(request, state).await,
         "thread.link" => handle_thread_link(request, state).await,
         "thread.resolve" => handle_thread_resolve(request, state).await,
         "thread.attach" => handle_thread_attach(request, state).await,
+        "thread.delete" => handle_thread_delete(request, state).await,
+        "thread.example.create" => handle_thread_example_create(request, state).await,
         "prefetch" => handle_prefetch(request, state).await,
         "status" => handle_status(request, state).await,
         "shutdown" => handle_shutdown(request, shutdown_tx).await,
@@ -287,6 +298,44 @@ async fn handle_thread_attach(
             -32000,
             format!("Thread attach failed: {e}"),
             None,
+        ),
+    }
+}
+
+async fn handle_thread_delete(
+    request: JsonRpcRequest,
+    state: &Arc<DaemonState>,
+) -> JsonRpcResponse {
+    let params: ThreadDeleteParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return *response,
+    };
+    match thread_delete(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => JsonRpcResponse::error(
+            request.id,
+            -32000,
+            format!("Thread delete failed: {e}"),
+            None,
+        ),
+    }
+}
+
+async fn handle_thread_example_create(
+    request: JsonRpcRequest,
+    state: &Arc<DaemonState>,
+) -> JsonRpcResponse {
+    let params: ThreadExampleCreateParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return *response,
+    };
+    match thread_example_create(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => JsonRpcResponse::error(
+            request.id,
+            -32001,
+            format!("Thread example create failed: {e}"),
+            Some(serde_json::json!({ "retryable": true })),
         ),
     }
 }
@@ -448,6 +497,102 @@ async fn handle_scratch_create(
             -32001,
             format!("Scratch generation failed: {e}"),
             Some(serde_json::json!({ "retryable": true })),
+        ),
+    }
+}
+
+async fn handle_mark_create(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcResponse {
+    let params: MarkCreateParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return *response,
+    };
+    match mark_create(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => {
+            JsonRpcResponse::error(request.id, -32000, format!("Mark create failed: {e}"), None)
+        }
+    }
+}
+
+async fn handle_mark_list(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcResponse {
+    let params: MarkListParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return *response,
+    };
+    match mark_list(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => {
+            JsonRpcResponse::error(request.id, -32000, format!("Mark list failed: {e}"), None)
+        }
+    }
+}
+
+async fn handle_mark_delete(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcResponse {
+    let params: MarkDeleteParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return *response,
+    };
+    match mark_delete(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => {
+            JsonRpcResponse::error(request.id, -32000, format!("Mark delete failed: {e}"), None)
+        }
+    }
+}
+
+async fn handle_mark_next(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcResponse {
+    let params: MarkStepParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return *response,
+    };
+    match mark_next(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => {
+            JsonRpcResponse::error(request.id, -32000, format!("Mark next failed: {e}"), None)
+        }
+    }
+}
+
+async fn handle_mark_prev(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcResponse {
+    let params: MarkStepParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return *response,
+    };
+    match mark_prev(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => {
+            JsonRpcResponse::error(request.id, -32000, format!("Mark prev failed: {e}"), None)
+        }
+    }
+}
+
+async fn handle_settings_get(request: JsonRpcRequest, state: &Arc<DaemonState>) -> JsonRpcResponse {
+    match settings_get(state).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => JsonRpcResponse::error(
+            request.id,
+            -32000,
+            format!("Settings get failed: {e}"),
+            None,
+        ),
+    }
+}
+
+async fn handle_settings_update(
+    request: JsonRpcRequest,
+    state: &Arc<DaemonState>,
+) -> JsonRpcResponse {
+    let params: SettingsUpdateParams = match required_params(&request) {
+        Ok(params) => params,
+        Err(response) => return *response,
+    };
+    match settings_update(state, &params).await {
+        Ok(result) => JsonRpcResponse::success(request.id, serde_json::json!(result)),
+        Err(e) => JsonRpcResponse::error(
+            request.id,
+            -32000,
+            format!("Settings update failed: {e}"),
+            None,
         ),
     }
 }
@@ -731,7 +876,83 @@ pub async fn scratch_create(
     state: &Arc<DaemonState>,
     params: &ScratchCreateParams,
 ) -> anyhow::Result<crate::rpc::ScratchCreateResult> {
-    crate::scratch::create(&state.scratch, params).await
+    let settings = state.settings.load()?;
+    crate::scratch::create(
+        &state.scratch,
+        params,
+        &ScratchWriteOptions::new(settings.scratch_storage_mode, None),
+    )
+    .await
+}
+
+/// Create a persistent external source mark.
+pub async fn mark_create(
+    state: &Arc<DaemonState>,
+    params: &MarkCreateParams,
+) -> anyhow::Result<crate::marks::MarkCreateResult> {
+    state.marks.create(params)
+}
+
+/// List persistent external source marks.
+pub async fn mark_list(
+    state: &Arc<DaemonState>,
+    params: &MarkListParams,
+) -> anyhow::Result<crate::marks::MarkListResult> {
+    state.marks.list(params)
+}
+
+/// Delete an external source mark, and optionally its attached thread.
+pub async fn mark_delete(
+    state: &Arc<DaemonState>,
+    params: &MarkDeleteParams,
+) -> anyhow::Result<crate::marks::MarkDeleteResult> {
+    let result = state.marks.delete(params)?;
+    if params.delete_attached_thread
+        && let Some(thread_id) = result.mark.as_ref().and_then(|mark| mark.thread_id.clone())
+    {
+        let deleted = thread_delete(
+            state,
+            &ThreadDeleteParams {
+                thread_id: thread_id.clone(),
+            },
+        )
+        .await?;
+        if deleted.thread.is_none() {
+            state.marks.unlink_thread(&thread_id)?;
+        }
+    }
+    Ok(result)
+}
+
+/// Return the next mark in a file.
+pub async fn mark_next(
+    state: &Arc<DaemonState>,
+    params: &MarkStepParams,
+) -> anyhow::Result<crate::marks::MarkStepResult> {
+    state.marks.next(params)
+}
+
+/// Return the previous mark in a file.
+pub async fn mark_prev(
+    state: &Arc<DaemonState>,
+    params: &MarkStepParams,
+) -> anyhow::Result<crate::marks::MarkStepResult> {
+    state.marks.prev(params)
+}
+
+/// Return daemon settings.
+pub async fn settings_get(
+    state: &Arc<DaemonState>,
+) -> anyhow::Result<crate::settings::SettingsResult> {
+    state.settings.get()
+}
+
+/// Update daemon settings.
+pub async fn settings_update(
+    state: &Arc<DaemonState>,
+    params: &SettingsUpdateParams,
+) -> anyhow::Result<crate::settings::SettingsResult> {
+    state.settings.update(params)
 }
 
 /// List Codex sessions for a workspace.
@@ -746,7 +967,20 @@ pub async fn thread_create(
     state: &Arc<DaemonState>,
     params: &ThreadCreateParams,
 ) -> anyhow::Result<crate::threads::ThreadCreateResult> {
-    state.threads.create(params)
+    let mark = state.marks.create_mark(
+        &params.workspace,
+        &params.file,
+        params.offset,
+        &params.content,
+        None,
+    )?;
+    let created = state
+        .threads
+        .create_with_mark(params, Some(mark.mark_id.clone()))?;
+    state
+        .marks
+        .link_thread(&mark.mark_id, &created.thread.thread_id)?;
+    Ok(created)
 }
 
 /// List persistent source-line thread anchors.
@@ -778,7 +1012,98 @@ pub async fn thread_attach(
     state: &Arc<DaemonState>,
     params: &ThreadAttachParams,
 ) -> anyhow::Result<crate::threads::ThreadLinkResult> {
-    state.threads.attach(params)
+    let mark = state.marks.create_mark(
+        &params.workspace,
+        &params.file,
+        params.offset,
+        &params.content,
+        None,
+    )?;
+    let created = state.threads.create_with_mark(
+        &ThreadCreateParams {
+            workspace: params.workspace.clone(),
+            file: params.file.clone(),
+            offset: params.offset,
+            content: params.content.clone(),
+            prompt: format!("Attached Codex session {}", params.codex_session_id),
+            selection_start: None,
+            selection_end: None,
+            model: None,
+            reasoning_effort: None,
+        },
+        Some(mark.mark_id.clone()),
+    )?;
+    let linked = state.threads.link(&ThreadLinkParams {
+        thread_id: created.thread.thread_id,
+        codex_session_id: params.codex_session_id.clone(),
+        codex_session_path: None,
+    })?;
+    state
+        .marks
+        .link_thread(&mark.mark_id, &linked.thread.thread_id)?;
+    Ok(linked)
+}
+
+/// Delete a thread and its scratch artifacts.
+pub async fn thread_delete(
+    state: &Arc<DaemonState>,
+    params: &ThreadDeleteParams,
+) -> anyhow::Result<crate::threads::ThreadDeleteResult> {
+    let deleted = state.threads.delete(params)?;
+    if let Some(thread) = &deleted.thread {
+        let settings = state.settings.load()?;
+        for example in &thread.examples {
+            crate::scratch::delete_artifact_scratch_dir(
+                &state.runtime_dir,
+                Path::new(&example.path),
+            )?;
+        }
+        crate::scratch::delete_thread_scratch_dir(
+            &state.runtime_dir,
+            settings.scratch_storage_mode,
+            Path::new(&thread.workspace),
+            &thread.thread_id,
+        )?;
+        state.marks.unlink_thread(&thread.thread_id)?;
+    }
+    Ok(deleted)
+}
+
+/// Create a scratch example artifact and link it to a persistent thread.
+pub async fn thread_example_create(
+    state: &Arc<DaemonState>,
+    params: &ThreadExampleCreateParams,
+) -> anyhow::Result<crate::threads::ThreadExampleCreateResult> {
+    let settings = state.settings.load()?;
+    let scratch = crate::scratch::create(
+        &state.scratch,
+        &ScratchCreateParams {
+            workspace: params.workspace.clone(),
+            file: params.file.clone(),
+            offset: params.offset,
+            content: params.content.clone(),
+            prompt: params.prompt.clone(),
+            selection_start: params.selection_start,
+            selection_end: params.selection_end,
+            model: params.model.clone(),
+            reasoning_effort: params.reasoning_effort.clone(),
+        },
+        &ScratchWriteOptions::new(
+            settings.scratch_storage_mode,
+            Some(params.thread_id.clone()),
+        ),
+    )
+    .await?;
+    state
+        .threads
+        .add_example(&params.thread_id, &scratch, &params.prompt)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "created example at {}, but failed to link it to thread {}: {error}",
+                scratch.path,
+                params.thread_id
+            )
+        })
 }
 
 /// Scan a file or workspace path, find anchors, and populate the proposal cache.

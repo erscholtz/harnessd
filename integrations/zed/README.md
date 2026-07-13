@@ -1,31 +1,18 @@
 # Zed
 
-`harnessd` already exposes a thin `bridge` command. This folder keeps the
-editor-facing wrappers next to the rest of the integration assets instead of
-burying them inside `src/`.
+This folder contains legacy Zed completion assets from the previous product
+direction.
 
-Files:
+The new `harnessd` direction is Neovim-first marks, scratchpad/whiteboard
+views, external scratch files, and guarded cleanup. Zed completion support is
+not part of that direction, and normal setup should not install the Zed dev
+extension.
 
-- `complete.ps1`: one-shot completion bridge for Windows/Zed tasks
-- `prefetch.ps1`: cache warmup bridge for Windows/Zed tasks
-- `extension/`: local Zed dev extension that launches `harnessd lsp` for Rust autocomplete
+Files currently kept for removal or migration:
 
-Both wrappers keep the editor side thin and forward straight to:
+- `complete.ps1`: legacy one-shot completion bridge.
+- `prefetch.ps1`: legacy cache warmup bridge.
+- `extension/`: legacy local dev extension that launched `harnessd lsp`.
 
-- `harnessd bridge --method complete ...`
-- `harnessd bridge --method prefetch ...`
-
-The PowerShell wrappers accept explicit arguments so you can wire them into
-whatever Zed task shape you prefer without changing daemon code.
-
-## Autocomplete
-
-Build `harnessd`, then install `extension/` with `zed: install dev extension`.
-The extension registers a Rust language server that runs:
-
-```powershell
-harnessd lsp
-```
-
-The LSP adapter stores open document text, prefetches on open/save, and returns
-daemon-backed completion items through Zed's normal autocomplete popup.
+Avoid adding new behavior here unless it directly supports removing or
+migrating the legacy Zed autocomplete path.

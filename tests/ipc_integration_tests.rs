@@ -7,8 +7,10 @@ use std::time::Duration;
 use harnessd::acp::AcpClient;
 use harnessd::ipc;
 use harnessd::rpc::{
-    AnchorsParams, CompleteParams, GenerateParams, InlineFastParams, InlineParams, PrefetchParams,
-    ScratchCreateParams, ThreadCreateParams, ThreadLinkParams, ThreadListParams,
+    AnchorsParams, CompleteParams, GenerateParams, InlineFastParams, InlineParams,
+    MarkCreateParams, MarkDeleteParams, MarkListParams, MarkStepParams, PrefetchParams,
+    ScratchCreateParams, ScratchStorageMode, SettingsUpdateParams, ThreadCreateParams,
+    ThreadDeleteParams, ThreadLinkParams, ThreadListParams,
 };
 use harnessd::scratch::ScratchClient;
 use harnessd::state::DaemonState;
@@ -270,6 +272,149 @@ async fn thread_rpc_helpers_create_list_and_link() {
     .expect("thread list failed");
     assert_eq!(listed.threads.len(), 1);
     assert_eq!(listed.threads[0].current_line, 3);
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[tokio::test]
+async fn settings_update_controls_scratch_storage_mode() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).expect("failed to create runtime dir");
+    let state = DaemonState::new(runtime_dir.clone()).expect("failed to create daemon state");
+
+    let initial = ipc::settings_get(&state)
+        .await
+        .expect("settings get failed");
+    assert_eq!(
+        initial.settings.scratch_storage_mode,
+        ScratchStorageMode::Runtime
+    );
+
+    let updated = ipc::settings_update(
+        &state,
+        &SettingsUpdateParams {
+            scratch_storage_mode: Some(ScratchStorageMode::Temp),
+            read_scope: None,
+        },
+    )
+    .await
+    .expect("settings update failed");
+    assert_eq!(
+        updated.settings.scratch_storage_mode,
+        ScratchStorageMode::Temp
+    );
+
+    let loaded = ipc::settings_get(&state)
+        .await
+        .expect("settings get failed");
+    assert_eq!(
+        loaded.settings.scratch_storage_mode,
+        ScratchStorageMode::Temp
+    );
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[tokio::test]
+async fn mark_rpc_helpers_create_list_step_and_delete() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).expect("failed to create runtime dir");
+
+    let file_path = runtime_dir.join("fixture.rs");
+    let source = "fn demo() {\n    let first = 1;\n    let second = 2;\n}\n";
+    std::fs::write(&file_path, source).expect("failed to write fixture");
+    let state = DaemonState::new(runtime_dir.clone()).expect("failed to create daemon state");
+
+    let first = ipc::mark_create(
+        &state,
+        &MarkCreateParams {
+            workspace: runtime_dir.to_string_lossy().to_string(),
+            file: file_path.to_string_lossy().to_string(),
+            offset: source.find("first").unwrap(),
+            content: source.to_string(),
+            thread_id: None,
+        },
+    )
+    .await
+    .expect("mark create failed");
+    let second = ipc::mark_create(
+        &state,
+        &MarkCreateParams {
+            workspace: runtime_dir.to_string_lossy().to_string(),
+            file: file_path.to_string_lossy().to_string(),
+            offset: source.find("second").unwrap(),
+            content: source.to_string(),
+            thread_id: Some("thread-1".to_string()),
+        },
+    )
+    .await
+    .expect("mark create failed");
+    assert_eq!(first.mark.current_line, 2);
+    assert_eq!(second.mark.current_line, 3);
+
+    let shifted = "fn prelude() {}\nfn demo() {\n    let first = 1;\n    let second = 2;\n}\n";
+    let listed = ipc::mark_list(
+        &state,
+        &MarkListParams {
+            workspace: runtime_dir.to_string_lossy().to_string(),
+            file: Some(file_path.to_string_lossy().to_string()),
+            content: Some(shifted.to_string()),
+        },
+    )
+    .await
+    .expect("mark list failed");
+    assert_eq!(listed.marks.len(), 2);
+    assert!(listed.marks.iter().any(|mark| mark.current_line == 3));
+    assert!(listed.marks.iter().any(|mark| mark.current_line == 4));
+
+    let next = ipc::mark_next(
+        &state,
+        &MarkStepParams {
+            workspace: runtime_dir.to_string_lossy().to_string(),
+            file: file_path.to_string_lossy().to_string(),
+            current_line: 3,
+            content: None,
+        },
+    )
+    .await
+    .expect("mark next failed");
+    assert_eq!(next.mark.unwrap().current_line, 4);
+
+    let prev = ipc::mark_prev(
+        &state,
+        &MarkStepParams {
+            workspace: runtime_dir.to_string_lossy().to_string(),
+            file: file_path.to_string_lossy().to_string(),
+            current_line: 4,
+            content: None,
+        },
+    )
+    .await
+    .expect("mark prev failed");
+    assert_eq!(prev.mark.unwrap().current_line, 3);
+
+    let attached_delete = ipc::mark_delete(
+        &state,
+        &MarkDeleteParams {
+            mark_id: second.mark.mark_id.clone(),
+            delete_attached_thread: false,
+        },
+    )
+    .await
+    .expect_err("attached mark delete should require explicit confirmation");
+    assert!(attached_delete.to_string().contains("attached thread"));
+
+    let deleted = ipc::mark_delete(
+        &state,
+        &MarkDeleteParams {
+            mark_id: second.mark.mark_id,
+            delete_attached_thread: true,
+        },
+    )
+    .await
+    .expect("mark delete failed");
+    assert!(deleted.mark.is_some());
+    assert!(deleted.deleted_thread);
 
     std::fs::remove_dir_all(&runtime_dir).ok();
 }
@@ -1081,11 +1226,16 @@ printf '%s\n' '{{"title":"Usage sketch","body":"fn main() {{\n    println!(\"scr
     assert!(args.contains("--ask-for-approval\nnever"));
     assert!(args.contains("--sandbox\nread-only"));
     assert!(args.contains("--cd\n"));
-    assert!(args.contains(&workspace.to_string_lossy().to_string()));
+    assert!(args.contains(&runtime_dir.to_string_lossy().to_string()));
     let prompt = std::fs::read_to_string(prompt_log).unwrap();
     assert!(prompt.contains("unsaved_value"));
-    assert!(prompt.contains("must not edit files"));
-    assert!(result.relative_path.starts_with("scratch/harnessd/"));
+    assert!(prompt.contains("Do not inspect the repository"));
+    assert!(result.relative_path.starts_with("scratch/"));
+    assert!(
+        !result
+            .path
+            .starts_with(&workspace.to_string_lossy().to_string())
+    );
     assert!(result.relative_path.ends_with(".rs"));
     let written = std::fs::read_to_string(&result.path).unwrap();
     assert!(written.contains("harnessd scratch preview"));
@@ -1213,6 +1363,194 @@ printf '%s\n' '{"title":"Demo","body":"fn main() {}"}' > "$out"
     assert_ne!(first.path, second.path);
     assert!(std::path::Path::new(&first.path).exists());
     assert!(std::path::Path::new(&second.path).exists());
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn thread_example_create_writes_artifact_and_links_thread() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let fake = fake_codex(
+        &runtime_dir,
+        r##"#!/bin/sh
+out=""
+next=0
+for arg in "$@"; do
+  if [ "$next" = "1" ]; then out="$arg"; next=0; elif [ "$arg" = "--output-last-message" ]; then next=1; fi
+done
+printf '%s\n' '{"title":"Demo","body":"fn main() {}"}' > "$out"
+"##,
+    );
+    let workspace = runtime_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let file_path = workspace.join("main.rs");
+    let source = "fn demo() {\n    let value = 1;\n}\n";
+    std::fs::write(&file_path, "fn saved() {}\n").unwrap();
+    let state = DaemonState::new_with_clients(
+        runtime_dir.clone(),
+        AcpClient::new(runtime_dir.join("unused-acp")),
+        ScratchClient::new(fake, runtime_dir.clone()),
+    )
+    .unwrap();
+    let created = ipc::thread_create(
+        &state,
+        &ThreadCreateParams {
+            workspace: workspace.to_string_lossy().to_string(),
+            file: file_path.to_string_lossy().to_string(),
+            offset: source.find("value").unwrap(),
+            content: source.to_string(),
+            prompt: "explain value".to_string(),
+            selection_start: None,
+            selection_end: None,
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let result = ipc::thread_example_create(
+        &state,
+        &harnessd::rpc::ThreadExampleCreateParams {
+            thread_id: created.thread.thread_id.clone(),
+            workspace: workspace.to_string_lossy().to_string(),
+            file: file_path.to_string_lossy().to_string(),
+            offset: source.find("value").unwrap(),
+            content: source.to_string(),
+            prompt: "show usage".to_string(),
+            selection_start: None,
+            selection_end: None,
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.thread.examples.len(), 1);
+    assert_eq!(result.example.prompt, "show usage");
+    assert!(result.example.relative_path.starts_with("scratch/"));
+    assert!(
+        result
+            .example
+            .relative_path
+            .contains(&created.thread.thread_id)
+    );
+    assert!(std::path::Path::new(&result.example.path).exists());
+
+    std::fs::remove_dir_all(&runtime_dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn thread_delete_removes_thread_scratch_and_unlinks_mark() {
+    let runtime_dir = temp_runtime_dir();
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let fake = fake_codex(
+        &runtime_dir,
+        r##"#!/bin/sh
+out=""
+next=0
+for arg in "$@"; do
+  if [ "$next" = "1" ]; then out="$arg"; next=0; elif [ "$arg" = "--output-last-message" ]; then next=1; fi
+done
+printf '%s\n' '{"title":"Demo","body":"fn main() {}"}' > "$out"
+"##,
+    );
+    let workspace = runtime_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let file_path = workspace.join("main.rs");
+    let source = "fn demo() {\n    let value = 1;\n}\n";
+    std::fs::write(&file_path, "fn saved() {}\n").unwrap();
+    let state = DaemonState::new_with_clients(
+        runtime_dir.clone(),
+        AcpClient::new(runtime_dir.join("unused-acp")),
+        ScratchClient::new(fake, runtime_dir.clone()),
+    )
+    .unwrap();
+
+    let created = ipc::thread_create(
+        &state,
+        &ThreadCreateParams {
+            workspace: workspace.to_string_lossy().to_string(),
+            file: file_path.to_string_lossy().to_string(),
+            offset: source.find("value").unwrap(),
+            content: source.to_string(),
+            prompt: "explain value".to_string(),
+            selection_start: None,
+            selection_end: None,
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    let mark_id = created
+        .thread
+        .mark_id
+        .clone()
+        .expect("thread should have mark");
+
+    let example = ipc::thread_example_create(
+        &state,
+        &harnessd::rpc::ThreadExampleCreateParams {
+            thread_id: created.thread.thread_id.clone(),
+            workspace: workspace.to_string_lossy().to_string(),
+            file: file_path.to_string_lossy().to_string(),
+            offset: source.find("value").unwrap(),
+            content: source.to_string(),
+            prompt: "show usage".to_string(),
+            selection_start: None,
+            selection_end: None,
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await
+    .unwrap();
+    let artifact_path = std::path::PathBuf::from(&example.example.path);
+    let scratch_dir = artifact_path.parent().unwrap().to_path_buf();
+    assert!(scratch_dir.exists());
+
+    ipc::settings_update(
+        &state,
+        &SettingsUpdateParams {
+            scratch_storage_mode: Some(ScratchStorageMode::Temp),
+            read_scope: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let deleted = ipc::thread_delete(
+        &state,
+        &ThreadDeleteParams {
+            thread_id: created.thread.thread_id.clone(),
+        },
+    )
+    .await
+    .expect("thread delete failed");
+    assert!(deleted.thread.is_some());
+    assert!(!scratch_dir.exists());
+
+    let marks = ipc::mark_list(
+        &state,
+        &MarkListParams {
+            workspace: workspace.to_string_lossy().to_string(),
+            file: Some(file_path.to_string_lossy().to_string()),
+            content: None,
+        },
+    )
+    .await
+    .unwrap();
+    let mark = marks
+        .marks
+        .into_iter()
+        .find(|mark| mark.mark_id == mark_id)
+        .expect("mark should remain after thread delete");
+    assert_eq!(mark.thread_id, None);
 
     std::fs::remove_dir_all(&runtime_dir).ok();
 }

@@ -1,7 +1,7 @@
-//! Local research harness: CLI, long-lived daemon, and editor bridge.
+//! Local scratchpad and external mark daemon: CLI, long-lived daemon, and editor bridge.
 //!
-//! This crate provides an autocomplete-first daemon that uses tree-sitter
-//! to understand code structure and provides cached completion suggestions.
+//! This crate provides persistent external source marks, optional threads,
+//! linked scratch artifacts, settings, and compatibility autocomplete APIs.
 
 #![warn(missing_docs)]
 
@@ -25,6 +25,8 @@ pub mod dashboard;
 pub mod ipc;
 /// Editor-facing LSP adapter.
 pub mod lsp;
+/// External source mark storage.
+pub mod marks;
 /// Model override validation and config rendering.
 pub mod models;
 /// Tree-sitter parsing and anchor detection.
@@ -37,6 +39,8 @@ pub mod rpc;
 pub mod runtime;
 /// Scratch preview artifact generation.
 pub mod scratch;
+/// Daemon-owned settings.
+pub mod settings;
 /// Shutdown signal handling.
 pub mod shutdown;
 /// Shared daemon state.

@@ -3,6 +3,8 @@ vim.opt.rtp:append(vim.fn.getcwd() .. "/integrations/nvim")
 local h = require("harnessd")
 local fixture = vim.fn.tempname() .. ".rs"
 vim.fn.writefile({ "fn demo() {", "    let value = 1;", "}" }, fixture)
+vim.fn.mkdir(vim.fn.getcwd() .. "/scratch/hash/thread-test", "p")
+vim.fn.writefile({ "// harnessd scratch preview", "fn main() {}" }, vim.fn.getcwd() .. "/scratch/hash/thread-test/demo.rs")
 vim.cmd("edit " .. vim.fn.fnameescape(fixture))
 local source = vim.api.nvim_get_current_buf()
 vim.api.nvim_win_set_cursor(0, { 2, 4 })
@@ -83,8 +85,8 @@ vim.system = function(args, opts, callback)
   elseif method == "scratch" then
     stdout = vim.json.encode({
       result = {
-        path = vim.fn.getcwd() .. "/scratch/harnessd/demo.rs",
-        relative_path = "scratch/harnessd/demo.rs",
+        path = vim.fn.getcwd() .. "/scratch/hash/standalone/demo.rs",
+        relative_path = "scratch/hash/standalone/demo.rs",
         bytes = 42,
         lines = 3,
         created_at = 1,
@@ -95,8 +97,9 @@ vim.system = function(args, opts, callback)
   elseif method == "thread" and args[3] == "create" then
     stdout = vim.json.encode({
       result = {
-        thread = {
-          thread_id = "thread-test",
+          thread = {
+            thread_id = "thread-test",
+            mark_id = "mark-test",
           workspace = vim.fn.getcwd(),
           file = fixture,
           original_line = 2,
@@ -135,14 +138,132 @@ vim.system = function(args, opts, callback)
             prompt_preview = "open a thread",
             prompt = "open a thread",
             status = "open",
+            examples = {
+              {
+                example_id = "example-test",
+                thread_id = "thread-test",
+                title = "show usage",
+                path = vim.fn.getcwd() .. "/scratch/hash/thread-test/demo.rs",
+                relative_path = "scratch/hash/thread-test/demo.rs",
+                prompt = "show usage",
+                prompt_preview = "show usage",
+                source_file = fixture,
+                bytes = 42,
+                lines = 3,
+                created_at = 2,
+              },
+            },
             created_at = 1,
             updated_at = 1,
           },
         },
       },
     })
+  elseif method == "thread" and args[3] == "example" then
+    stdout = vim.json.encode({
+      result = {
+          thread = {
+            thread_id = "thread-test",
+            mark_id = "mark-test",
+          workspace = vim.fn.getcwd(),
+          file = fixture,
+          original_line = 2,
+          current_line = 2,
+          byte_offset = 16,
+          line_hash = "hash",
+          line_preview = "let unsaved_value = 1;",
+          prompt_preview = "open a thread",
+          prompt = "open a thread",
+          status = "linked",
+          examples = {
+            {
+              example_id = "example-test",
+              thread_id = "thread-test",
+              title = "show usage",
+              path = vim.fn.getcwd() .. "/scratch/hash/thread-test/demo.rs",
+              relative_path = "scratch/hash/thread-test/demo.rs",
+              prompt = "show usage",
+              prompt_preview = "show usage",
+              source_file = fixture,
+              bytes = 42,
+              lines = 3,
+              created_at = 2,
+            },
+          },
+          created_at = 1,
+          updated_at = 2,
+        },
+        example = {
+          example_id = "example-test",
+          thread_id = "thread-test",
+          title = "show usage",
+          path = vim.fn.getcwd() .. "/scratch/hash/thread-test/demo.rs",
+          relative_path = "scratch/hash/thread-test/demo.rs",
+          prompt = "show usage",
+          prompt_preview = "show usage",
+          source_file = fixture,
+          bytes = 42,
+          lines = 3,
+          created_at = 2,
+        },
+      },
+    })
   elseif method == "thread" and args[3] == "resolve" then
     stdout = vim.json.encode({ result = { resolved = false } })
+  elseif method == "mark" and args[3] == "list" then
+    stdout = vim.json.encode({
+      result = {
+        marks = {
+          {
+            mark_id = "mark-test",
+            workspace = vim.fn.getcwd(),
+            file = fixture,
+            original_line = 2,
+            current_line = 2,
+            byte_offset = 16,
+            line_hash = "hash",
+            line_preview = "let unsaved_value = 1;",
+            thread_id = "thread-test",
+            status = "linked",
+            created_at = 1,
+            updated_at = 1,
+          },
+        },
+      },
+    })
+  elseif method == "mark" and (args[3] == "next" or args[3] == "prev") then
+    stdout = vim.json.encode({
+      result = {
+        mark = {
+          mark_id = "mark-test",
+          workspace = vim.fn.getcwd(),
+          file = fixture,
+          original_line = 2,
+          current_line = 2,
+          byte_offset = 16,
+          line_hash = "hash",
+          line_preview = "let unsaved_value = 1;",
+          thread_id = "thread-test",
+          status = "linked",
+          created_at = 1,
+          updated_at = 1,
+        },
+      },
+    })
+  elseif method == "settings" and args[3] == "get" then
+    stdout = vim.json.encode({
+      result = { settings = { scratch_storage_mode = "runtime", read_scope = "current_context" } },
+    })
+  elseif method == "settings" and args[3] == "update" then
+    local storage = "runtime"
+    for index = 1, #args - 1 do
+      if args[index] == "--scratch-storage-mode" then
+        storage = args[index + 1]
+      end
+    end
+    stdout = vim.json.encode({
+      result = { settings = { scratch_storage_mode = storage, read_scope = "current_context" } },
+    })
   elseif method == "codex-sessions" then
     stdout = vim.json.encode({
       result = {
@@ -173,20 +294,31 @@ h.setup({
     return 77
   end,
 })
+assert(vim.fn.exists(":HarnessdPanel") == 2)
+assert(vim.fn.exists(":HarnessdPanelFlip") == 2)
+assert(vim.fn.exists(":HarnessdExample") == 2)
 assert(vim.fn.exists(":HarnessdAsk") == 2)
-assert(vim.fn.exists(":HarnessdInline") == 2)
 assert(vim.fn.exists(":HarnessdScratch") == 2)
 assert(vim.fn.exists(":HarnessdThreads") == 2)
+assert(vim.fn.exists(":HarnessdMarks") == 2)
+assert(vim.fn.exists(":HarnessdMarkNext") == 2)
+assert(vim.fn.exists(":HarnessdMarkPrev") == 2)
 assert(vim.fn.exists(":HarnessdSettings") == 2)
 assert(vim.fn.exists(":HarnessdModels") == 2)
-assert(vim.fn.exists(":HarnessdInlineComplete") == 2)
-assert(vim.fn.exists(":HarnessdPrepareContext") == 2)
+assert(vim.fn.exists(":HarnessdInline") == 0)
+assert(vim.fn.exists(":HarnessdInlineComplete") == 0)
+assert(vim.fn.exists(":HarnessdPrepareContext") == 0)
 assert(vim.fn.exists(":HarnessdAccept") == 2)
+assert(vim.fn.maparg("<Plug>(HarnessdPanel)", "n") ~= "")
+assert(vim.fn.maparg("<Plug>(HarnessdExample)", "n") ~= "")
 assert(vim.fn.maparg("<Plug>(HarnessdAccept)", "n") ~= "")
 assert(vim.fn.maparg("<Plug>(HarnessdAcceptLine)", "i") ~= "")
-assert(vim.fn.maparg("<Plug>(HarnessdInlineComplete)", "i") ~= "")
-assert(vim.fn.maparg("<Plug>(HarnessdPrepareContext)", "i") ~= "")
+assert(vim.fn.maparg("<Plug>(HarnessdInlineComplete)", "i") == "")
+assert(vim.fn.maparg("<Plug>(HarnessdPrepareContext)", "i") == "")
 assert(vim.fn.maparg("<Plug>(HarnessdScratch)", "n") ~= "")
+assert(vim.fn.maparg("<Plug>(HarnessdMarks)", "n") ~= "")
+assert(vim.fn.maparg("<Plug>(HarnessdMarkNext)", "n") ~= "")
+assert(vim.fn.maparg("<Plug>(HarnessdMarkPrev)", "n") ~= "")
 assert(vim.fn.maparg("<Plug>(HarnessdSettings)", "n") ~= "")
 assert(vim.fn.maparg("<Plug>(HarnessdModels)", "n") ~= "")
 assert(h.model_for("line", source) == "gpt-5.4-mini")
@@ -198,12 +330,22 @@ assert(h.set_model("scratch", { model = "gpt-5.4-mini", reasoning_effort = "low"
 assert(h.get_models(source).ask.model == "gpt-5.5")
 assert(h.get_models(source).ask.reasoning_effort == "high")
 assert(h.is_auto_inline_enabled() == false)
-assert(h.statusline() == "autocomplete: [off] context: [idle] inline: [idle]")
+assert(h.statusline():find("harnessd: %[closed%]"))
 assert(h.toggle_auto_inline() == true)
 assert(h.is_auto_inline_enabled() == true)
-assert(h.statusline() == "autocomplete: [on] context: [idle] inline: [idle]")
+assert(h.statusline():find("harnessd: %[closed%]"))
 assert(h.toggle_auto_inline() == false)
-assert(h.statusline() == "autocomplete: [off] context: [idle] inline: [idle]")
+assert(h.statusline():find("harnessd: %[closed%]"))
+
+local settings_done = false
+h.settings_update({ scratch_storage_mode = "temp" }, function(_, err)
+  assert(err == nil)
+  settings_done = true
+end)
+vim.wait(1000, function() return settings_done end)
+assert(requests[#requests].args[2] == "settings")
+assert(requests[#requests].args[3] == "update")
+assert(has_arg_pair(requests[#requests].args, "--scratch-storage-mode", "temp"))
 
 local prepare_done = false
 h.prepare_inline({ force = true }, function(_, err)
@@ -212,7 +354,7 @@ h.prepare_inline({ force = true }, function(_, err)
 end)
 assert(h.context_status().state == "loading")
 assert(h.context_status().message == "preparing")
-assert(h.statusline():find("context: %[loading%]"))
+assert(h.statusline():find("harnessd:"))
 vim.wait(1000, function() return prepare_done end)
 assert(requests[#requests].args[2] == "bridge")
 assert(requests[#requests].args[4] == "inline.prepare")
@@ -221,7 +363,7 @@ assert(has_arg_pair(requests[#requests].args, "--reasoning-effort", "low"))
 assert(h.context_status().state == "ready")
 assert(h.context_status().last_attempt_at ~= nil)
 assert(h.context_status().last_ready_at ~= nil)
-assert(h.statusline() == "autocomplete: [off] context: [ready] inline: [idle]")
+assert(h.statusline():find("harnessd: %[closed%]"))
 
 mock_prepare_error = "context fetch failed"
 local prepare_failed = false
@@ -232,7 +374,7 @@ end)
 vim.wait(1000, function() return prepare_failed end)
 assert(h.context_status().state == "failed")
 assert(h.context_status().message:find("context fetch failed", 1, true))
-assert(h.statusline():find("context: %[failed%]"))
+assert(h.statusline():find("harnessd:"))
 mock_prepare_error = nil
 
 mock_delay_inline_fast = true
@@ -242,14 +384,14 @@ h.inline_complete({}, function(_, err)
   delayed_done = true
 end)
 assert(h.inline_status().state == "waiting")
-assert(h.statusline():find("inline: %[waiting%]"))
+assert(h.statusline():find("harnessd:"))
 pending_inline_fast()
 pending_inline_fast = nil
 mock_delay_inline_fast = false
 vim.wait(1000, function() return delayed_done end)
 assert(h.inline_status().state == "idle")
 assert(h.inline_status().source == "cache")
-assert(h.statusline():find("inline: %[idle%]"))
+assert(h.statusline():find("harnessd:"))
 
 mock_inline_fast_mode = "refresh"
 local refresh_done = false
@@ -259,7 +401,7 @@ h.inline_complete({}, function(_, err)
 end)
 vim.wait(1000, function() return refresh_done end)
 assert(h.inline_status().refresh == "queued")
-assert(h.statusline():find("inline: %[refresh%]"))
+assert(h.statusline():find("harnessd:"))
 mock_inline_fast_mode = "error"
 local failed_done = false
 h.inline_complete({}, function(_, err)
@@ -269,7 +411,7 @@ end)
 vim.wait(1000, function() return failed_done end)
 assert(h.inline_status().state == "failed")
 assert(h.inline_status().last_error:find("inline fast unavailable", 1, true))
-assert(h.statusline():find("inline: %[failed%]"))
+assert(h.statusline():find("harnessd:"))
 mock_inline_fast_mode = "suggestion"
 
 h.inline_ask()
@@ -370,7 +512,7 @@ assert(table.concat(vim.api.nvim_buf_get_lines(source, 0, -1, false), "\n") == s
 assert(#vim.api.nvim_buf_get_extmarks(source, ns, 0, -1, {}) == 0)
 vim.wait(1000, function()
   for _, notification in ipairs(notifications) do
-    if notification.message == "harnessd scratch: scratch/harnessd/demo.rs" then
+    if notification.message == "harnessd scratch: scratch/hash/standalone/demo.rs" then
       return true
     end
   end
@@ -378,7 +520,7 @@ vim.wait(1000, function()
 end)
 local scratch_notified = false
 for _, notification in ipairs(notifications) do
-  if notification.message == "harnessd scratch: scratch/harnessd/demo.rs" then
+  if notification.message == "harnessd scratch: scratch/hash/standalone/demo.rs" then
     scratch_notified = true
   end
 end
@@ -411,6 +553,69 @@ assert(channel_sends[#channel_sends].channel == 77)
 assert(channel_sends[#channel_sends].data == "/model gpt-5.5\n")
 local thread_ns = vim.api.nvim_get_namespaces().harnessd_threads
 assert(#vim.api.nvim_buf_get_extmarks(source, thread_ns, 0, -1, {}) >= 1)
+local mark_ns = vim.api.nvim_get_namespaces().harnessd_marks
+h.refresh_marks(source)
+vim.wait(1000, function()
+  return #vim.api.nvim_buf_get_extmarks(source, mark_ns, 0, -1, {}) >= 1
+end)
+assert(#vim.api.nvim_buf_get_extmarks(source, mark_ns, 0, -1, {}) >= 1)
+
+local mark_jump_done = false
+vim.api.nvim_set_current_buf(source)
+h.mark_next_current()
+vim.wait(1000, function()
+  if find_request("mark", "next") ~= nil then
+    mark_jump_done = true
+  end
+  return mark_jump_done
+end)
+assert(mark_jump_done, "mark next should request the daemon")
+
+vim.api.nvim_set_current_buf(source)
+vim.api.nvim_win_set_cursor(0, { 2, 4 })
+h.panel()
+assert(h.statusline():find("harnessd:"))
+h.panel_flip()
+assert(h.statusline():find("browse") or h.statusline():find("examples"))
+
+h.example_ask()
+local example_prompt = vim.api.nvim_get_current_buf()
+vim.api.nvim_buf_set_lines(example_prompt, 0, -1, false, { "show usage" })
+local example_submitted = false
+for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(example_prompt, "i")) do
+  if mapping.lhs == "<CR>" then
+    mapping.callback()
+    example_submitted = true
+  end
+end
+assert(example_submitted, "example prompt should install a submit mapping")
+vim.wait(1000, function()
+  return requests[#requests] and requests[#requests].args[2] == "thread" and requests[#requests].args[3] == "example"
+end)
+assert(has_arg_pair(requests[#requests].args, "--thread-id", "thread-test"))
+assert(requests[#requests].opts.stdin:find("fn changed", 1, true))
+vim.wait(1000, function()
+  for _, notification in ipairs(notifications) do
+    if notification.message == "harnessd example: scratch/hash/thread-test/demo.rs" then
+      return true
+    end
+  end
+  return false
+end)
+local example_notified = false
+for _, notification in ipairs(notifications) do
+  if notification.message == "harnessd example: scratch/hash/thread-test/demo.rs" then
+    example_notified = true
+  end
+end
+assert(example_notified, "example should notify the linked relative path")
+
+h.setup({ legacy_autocomplete = true })
+assert(vim.fn.exists(":HarnessdInline") == 2)
+assert(vim.fn.exists(":HarnessdInlineComplete") == 2)
+assert(vim.fn.exists(":HarnessdPrepareContext") == 2)
+assert(vim.fn.maparg("<Plug>(HarnessdInlineComplete)", "i") ~= "")
+assert(vim.fn.maparg("<Plug>(HarnessdPrepareContext)", "i") ~= "")
 
 vim.fn.delete(fixture)
 print("harnessd nvim headless tests passed")

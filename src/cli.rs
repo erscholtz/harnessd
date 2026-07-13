@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
@@ -133,6 +133,20 @@ pub enum Commands {
         command: ThreadCommands,
     },
 
+    /// Manage external source marks.
+    Mark {
+        /// Mark management action.
+        #[command(subcommand)]
+        command: MarkCommands,
+    },
+
+    /// Manage daemon-owned settings.
+    Settings {
+        /// Settings action.
+        #[command(subcommand)]
+        command: SettingsCommands,
+    },
+
     /// Send a research request to the daemon (starts daemon if needed).
     Research {
         /// Search query
@@ -249,4 +263,136 @@ pub enum ThreadCommands {
         #[arg(long)]
         session_id: String,
     },
+    /// Generate a scratch example and link it to a thread.
+    Example {
+        /// Parent thread id.
+        #[arg(long)]
+        thread_id: String,
+        /// Workspace root.
+        #[arg(long)]
+        workspace: PathBuf,
+        /// Source file path.
+        #[arg(long)]
+        file: PathBuf,
+        /// Cursor byte offset in stdin content.
+        #[arg(long)]
+        offset: usize,
+        /// User prompt for the example.
+        #[arg(long)]
+        prompt: String,
+        /// Optional selected start byte.
+        #[arg(long)]
+        selection_start: Option<usize>,
+        /// Optional selected end byte.
+        #[arg(long)]
+        selection_end: Option<usize>,
+        /// Optional model override for the example.
+        #[arg(long)]
+        model: Option<String>,
+        /// Optional reasoning effort override for the example.
+        #[arg(long)]
+        reasoning_effort: Option<String>,
+    },
+    /// Delete a thread and its scratch artifacts.
+    Delete {
+        /// Thread id.
+        #[arg(long)]
+        thread_id: String,
+    },
+}
+
+/// Subcommands for external source marks.
+#[derive(Subcommand)]
+pub enum MarkCommands {
+    /// Create a new external source mark; live buffer content is read from stdin.
+    Create {
+        /// Workspace root.
+        #[arg(long)]
+        workspace: PathBuf,
+        /// Source file path.
+        #[arg(long)]
+        file: PathBuf,
+        /// Cursor byte offset in stdin content.
+        #[arg(long)]
+        offset: usize,
+        /// Optional attached thread id.
+        #[arg(long)]
+        thread_id: Option<String>,
+    },
+    /// List marks; optional live buffer content is read from stdin when provided.
+    List {
+        /// Workspace root.
+        #[arg(long)]
+        workspace: PathBuf,
+        /// Optional source file path.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Delete a mark.
+    Delete {
+        /// Mark id.
+        #[arg(long)]
+        mark_id: String,
+        /// Also delete an attached thread and its scratch files.
+        #[arg(long, default_value_t = false)]
+        delete_attached_thread: bool,
+    },
+    /// Return the next mark in a file, wrapping around.
+    Next {
+        /// Workspace root.
+        #[arg(long)]
+        workspace: PathBuf,
+        /// Source file path.
+        #[arg(long)]
+        file: PathBuf,
+        /// Current 1-based cursor line.
+        #[arg(long)]
+        current_line: usize,
+    },
+    /// Return the previous mark in a file, wrapping around.
+    Prev {
+        /// Workspace root.
+        #[arg(long)]
+        workspace: PathBuf,
+        /// Source file path.
+        #[arg(long)]
+        file: PathBuf,
+        /// Current 1-based cursor line.
+        #[arg(long)]
+        current_line: usize,
+    },
+}
+
+/// Subcommands for daemon-owned settings.
+#[derive(Subcommand)]
+pub enum SettingsCommands {
+    /// Print current settings.
+    Get,
+    /// Update settings.
+    Update {
+        /// Scratch storage mode.
+        #[arg(long)]
+        scratch_storage_mode: Option<ScratchStorageModeArg>,
+        /// Read scope.
+        #[arg(long)]
+        read_scope: Option<ReadScopeArg>,
+    },
+}
+
+/// CLI scratch storage mode values.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum ScratchStorageModeArg {
+    /// Durable runtime-dir scratch storage.
+    Runtime,
+    /// Ephemeral OS temp-dir scratch storage.
+    Temp,
+}
+
+/// CLI read scope values.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum ReadScopeArg {
+    /// Current file/selection plus explicit context.
+    CurrentContext,
 }

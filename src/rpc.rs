@@ -5,10 +5,17 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub use crate::codex_sessions::{CodexSessionInfo, CodexSessionsParams, CodexSessionsResult};
+pub use crate::marks::{
+    MarkAnchor, MarkCreateParams, MarkCreateResult, MarkDeleteParams, MarkDeleteResult,
+    MarkListParams, MarkListResult, MarkStepParams, MarkStepResult,
+};
+pub use crate::settings::{
+    HarnessSettings, ReadScope, ScratchStorageMode, SettingsResult, SettingsUpdateParams,
+};
 pub use crate::threads::{
-    ThreadAnchor, ThreadAttachParams, ThreadCreateParams, ThreadCreateResult, ThreadLaunch,
-    ThreadLinkParams, ThreadLinkResult, ThreadListParams, ThreadListResult, ThreadResolveParams,
-    ThreadResolveResult,
+    ThreadAnchor, ThreadAttachParams, ThreadCreateParams, ThreadCreateResult, ThreadDeleteParams,
+    ThreadDeleteResult, ThreadExample, ThreadExampleCreateResult, ThreadLaunch, ThreadLinkParams,
+    ThreadLinkResult, ThreadListParams, ThreadListResult, ThreadResolveParams, ThreadResolveResult,
 };
 
 /// A JSON-RPC 2.0 request.
@@ -242,6 +249,35 @@ pub struct ScratchCreateResult {
     pub source_file: String,
     /// Bounded prompt preview.
     pub prompt_preview: String,
+}
+
+/// Parameters for creating a scratch example and linking it to a thread.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ThreadExampleCreateParams {
+    /// Parent thread id.
+    pub thread_id: String,
+    /// Absolute workspace root.
+    pub workspace: String,
+    /// Absolute source file path used for context and extension selection.
+    pub file: String,
+    /// Cursor position as a byte offset into `content`.
+    pub offset: usize,
+    /// Current editor buffer contents, including unsaved edits.
+    pub content: String,
+    /// User instruction for the example artifact.
+    pub prompt: String,
+    /// Optional selected start byte.
+    #[serde(default)]
+    pub selection_start: Option<usize>,
+    /// Optional selected end byte.
+    #[serde(default)]
+    pub selection_end: Option<usize>,
+    /// Optional model override for this example request.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional reasoning effort override for this example request.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 /// An anchor reported for an editor buffer.

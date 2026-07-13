@@ -1,5 +1,5 @@
 use clap::Parser;
-use harnessd::cli::{Cli, Commands, ThreadCommands};
+use harnessd::cli::{Cli, Commands, MarkCommands, SettingsCommands, ThreadCommands};
 
 #[test]
 fn parses_setup_with_prefetch_path() {
@@ -254,5 +254,162 @@ fn parses_thread_create_flags() {
             assert_eq!(reasoning_effort.as_deref(), Some("high"));
         }
         _ => panic!("expected thread create command"),
+    }
+}
+
+#[test]
+fn parses_thread_example_flags() {
+    let cli = Cli::parse_from([
+        "harnessd",
+        "thread",
+        "example",
+        "--thread-id",
+        "thread-1",
+        "--workspace",
+        ".",
+        "--file",
+        "src/main.rs",
+        "--offset",
+        "12",
+        "--prompt",
+        "show a usage example",
+        "--selection-start",
+        "1",
+        "--selection-end",
+        "5",
+        "--model",
+        "gpt-5.5",
+        "--reasoning-effort",
+        "high",
+    ]);
+
+    match cli.command {
+        Commands::Thread {
+            command:
+                ThreadCommands::Example {
+                    thread_id,
+                    workspace,
+                    file,
+                    offset,
+                    prompt,
+                    selection_start,
+                    selection_end,
+                    model,
+                    reasoning_effort,
+                },
+        } => {
+            assert_eq!(thread_id, "thread-1");
+            assert_eq!(workspace, std::path::PathBuf::from("."));
+            assert_eq!(file, std::path::PathBuf::from("src/main.rs"));
+            assert_eq!(offset, 12);
+            assert_eq!(prompt, "show a usage example");
+            assert_eq!(selection_start, Some(1));
+            assert_eq!(selection_end, Some(5));
+            assert_eq!(model.as_deref(), Some("gpt-5.5"));
+            assert_eq!(reasoning_effort.as_deref(), Some("high"));
+        }
+        _ => panic!("expected thread example command"),
+    }
+}
+
+#[test]
+fn parses_thread_delete_flags() {
+    let cli = Cli::parse_from(["harnessd", "thread", "delete", "--thread-id", "thread-1"]);
+
+    match cli.command {
+        Commands::Thread {
+            command: ThreadCommands::Delete { thread_id },
+        } => {
+            assert_eq!(thread_id, "thread-1");
+        }
+        _ => panic!("expected thread delete command"),
+    }
+}
+
+#[test]
+fn parses_mark_create_flags() {
+    let cli = Cli::parse_from([
+        "harnessd",
+        "mark",
+        "create",
+        "--workspace",
+        ".",
+        "--file",
+        "src/main.rs",
+        "--offset",
+        "12",
+        "--thread-id",
+        "thread-1",
+    ]);
+
+    match cli.command {
+        Commands::Mark {
+            command:
+                MarkCommands::Create {
+                    workspace,
+                    file,
+                    offset,
+                    thread_id,
+                },
+        } => {
+            assert_eq!(workspace, std::path::PathBuf::from("."));
+            assert_eq!(file, std::path::PathBuf::from("src/main.rs"));
+            assert_eq!(offset, 12);
+            assert_eq!(thread_id.as_deref(), Some("thread-1"));
+        }
+        _ => panic!("expected mark create command"),
+    }
+}
+
+#[test]
+fn parses_mark_delete_confirmation_flag() {
+    let cli = Cli::parse_from([
+        "harnessd",
+        "mark",
+        "delete",
+        "--mark-id",
+        "mark-1",
+        "--delete-attached-thread",
+    ]);
+
+    match cli.command {
+        Commands::Mark {
+            command:
+                MarkCommands::Delete {
+                    mark_id,
+                    delete_attached_thread,
+                },
+        } => {
+            assert_eq!(mark_id, "mark-1");
+            assert!(delete_attached_thread);
+        }
+        _ => panic!("expected mark delete command"),
+    }
+}
+
+#[test]
+fn parses_settings_update_flags() {
+    let cli = Cli::parse_from([
+        "harnessd",
+        "settings",
+        "update",
+        "--scratch-storage-mode",
+        "temp",
+        "--read-scope",
+        "current_context",
+    ]);
+
+    match cli.command {
+        Commands::Settings {
+            command:
+                SettingsCommands::Update {
+                    scratch_storage_mode,
+                    read_scope,
+                },
+        } => {
+            assert!(scratch_storage_mode.is_some());
+            assert!(read_scope.is_some());
+        }
+        _ => panic!("expected settings update command"),
     }
 }

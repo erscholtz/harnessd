@@ -1,116 +1,120 @@
 # Neovim
 
-This folder contains a minimal Neovim-side adapter for the current
-autocomplete-first `harnessd` daemon.
+This folder contains the primary `harnessd` UI. The target experience is a
+pinned scratchpad and text-whiteboard panel for external source marks, optional
+threads, linked scratch artifacts, and source jumps.
 
 Files:
 
-- `lua/harnessd.lua`: thin Lua wrapper around the `harnessd` CLI
+- `lua/harnessd.lua`: compatibility entrypoint for the Neovim plugin.
+- `lua/harnessd/init.lua`: main Lua implementation.
 
-The module currently exposes:
-
-- `setup(opts)` to register user commands
-- `complete(opts, callback)` to request completions for a file + byte offset
-- `thread_ask()` to create or reopen a line-anchored Codex thread
-- `inline_ask()` to ask for ephemeral ACP insertion text using the live buffer
-- `scratch_ask()` to generate a saved scratch preview file from live buffer context
-- `open_settings()` to configure buffer-local models and behavior toggles
-- `sidebar_toggle()` to open the Codex thread/session sidebar
-- `preview_complete()` to render the first saved-file cache hit as ghost text
-- `accept()` and `dismiss()` to manage the active ghost preview
-- `prefetch(path, callback)` to warm the proposal cache
-
-Minimal setup:
+## Minimal Setup
 
 ```lua
 vim.opt.rtp:append([[D:/School + Work/dev/harnessd/integrations/nvim]])
 require("harnessd").setup()
 ```
 
-Config options:
+## Target Workflow
+
+- Create or reuse an external mark at the cursor.
+- Open `:HarnessdPanel` to show the scratchpad/whiteboard panel for the current
+  mark or attached thread.
+- Use `:HarnessdThreads` to browse marks and see which marks have attached
+  threads.
+- Cycle marks from the source buffer and show attached thread state when
+  present.
+- Add scratch notes or linked artifacts without editing the source buffer.
+- Open linked scratch files from the panel.
+- Jump from a panel item back to the marked source location.
+
+Marks can exist without threads. A plain mark is still a useful source-location
+bookmark or review note.
+
+## Commands
+
+Current command names may be transitional while behavior moves toward
+mark/scratchpad semantics.
+
+- `:HarnessdPanel`: opens the scratchpad/whiteboard panel for the current mark
+  or attached thread.
+- `:HarnessdPanelFlip`: cycles panel views such as notes, scratch artifacts, and
+  mark/thread browse.
+- `:HarnessdThreads`: opens the mark/thread browser.
+- `:HarnessdMarks`: opens the same mark/thread browser.
+- `:HarnessdMarkNext`: jumps to the next external mark in the current file.
+- `:HarnessdMarkPrev`: jumps to the previous external mark in the current file.
+- `:HarnessdExample`: creates a linked scratch artifact for the active thread
+  or marked location.
+- `:HarnessdThreadOpen`: opens the thread attached to the current mark when one
+  exists.
+- `:HarnessdThreadAttach`: attaches an existing thread/session to the current
+  mark.
+- `:HarnessdSettings`: opens model and scratch-storage settings.
+
+`HarnessdAsk` may remain as a temporary compatibility alias for
+`HarnessdPanel`.
+
+## Panel Keys
+
+Target panel behavior:
+
+- `<Tab>` flips panel mode.
+- `e` creates a linked scratch artifact.
+- `g` jumps to the active source mark.
+- `<CR>` opens the selected mark, thread, scratch artifact, or session.
+- `r` refreshes.
+- `q` closes the panel.
+
+## Settings
+
+The settings panel includes:
+
+- model selection
+- scratch storage mode:
+  - `runtime`: default durable storage under the harnessd runtime dir
+  - `temp`: ephemeral storage under the OS temp dir
+- read-only project access with current-context read scope
+
+Target config shape:
 
 ```lua
 require("harnessd").setup({
   command = "harnessd",
   codex_command = "codex",
   sidebar_width = 72,
-  session_limit = 50,
   thread_sign_text = "H",
-  model_presets = {
-    { label = "default", model = nil, reasoning_effort = nil },
-    { label = "gpt-5.4-mini / low", model = "gpt-5.4-mini", reasoning_effort = "low" },
-    { label = "gpt-5.4-mini / medium", model = "gpt-5.4-mini", reasoning_effort = "medium" },
-    { label = "gpt-5.5 / medium", model = "gpt-5.5", reasoning_effort = "medium" },
-    { label = "gpt-5.5 / high", model = "gpt-5.5", reasoning_effort = "high" },
-  },
+  scratch_storage_mode = "runtime",
+  read_scope = "current_context",
   model_roles = {
     ask = { model = nil, reasoning_effort = nil },
-    line = { model = "gpt-5.4-mini", reasoning_effort = "low" },
     scratch = { model = nil, reasoning_effort = nil },
   },
 })
 ```
 
-Registered commands:
+## Scratch Storage
 
-- `:HarnessdPrefetch [path]`
-- `:HarnessdCompleteDebug`
-- `:HarnessdAsk`
-- `:HarnessdInline`
-- `:HarnessdScratch`
-- `:HarnessdThreads`
-- `:HarnessdThreadOpen`
-- `:HarnessdThreadAttach`
-- `:HarnessdComplete`
-- `:HarnessdSettings`
-- `:HarnessdModels` (compatibility alias)
-- `:HarnessdAccept`
-- `:HarnessdDismiss`
+Linked scratch files should live outside the workspace by default:
 
-`HarnessdAsk` opens a native floating prompt, creates a persistent line anchor,
-marks the source line with `H`, and launches a real
-`codex --no-alt-screen -C <workspace> ...` session in a right sidebar. Saved
-Codex sessions are read from `~/.codex/sessions` through the harnessd CLI and
-shown project-first.
+- Unix: `~/.local/share/harnessd/scratch/<workspace-hash>/<thread-id>/`
+- Windows: `%LOCALAPPDATA%\harnessd\scratch\<workspace-hash>\<thread-id>\`
 
-`HarnessdInline` is the former `HarnessdAsk` ghost-text insertion flow. It
-sends the current buffer, including unsaved edits, through `harnessd inline`.
-Its answer is rendered as virtual text and is inserted only with
-`HarnessdAccept`. `HarnessdComplete` uses the same preview surface for existing
-cached completions, and requires the buffer to be saved first.
+The `temp` settings toggle should redirect new scratch files to a harnessd-owned
+directory under the OS temp dir. Deleting a thread deletes its scratch files.
+Deleting a mark with an attached thread prompts before removing both the thread
+and its scratch files.
 
-`HarnessdScratch` prompts for a preview/MVP request, sends the current live
-buffer to `harnessd scratch`, and writes one generated example under
-`<workspace>/scratch/harnessd/`. It reports the created relative path without
-opening a split, rendering ghost text, or editing the source buffer.
+## Legacy Note
 
-`HarnessdSettings` opens a buffer-local settings pane. It includes model
-settings for `ask`, `line`, and `scratch`, plus behavior toggles such as
-auto-inline and context preparation. `<CR>` changes or toggles the selected
-setting, `r` resets it to the configured default, and `/` sends
-`/model <ask-model>` to the active Codex thread terminal when the cursor is on
-the `ask` row. Model choices are displayed as concrete model/effort pairs such
-as `gpt-5.4-mini / low`. `HarnessdModels` remains as a compatibility alias.
+The previous autocomplete, ghost-text, inline completion, LSP completion, and
+Zed completion surfaces are not part of the new Neovim product direction.
+Existing commands or tests may remain temporarily while the implementation is
+being cleaned up, but new work should target marks, scratch artifacts, settings,
+and cleanup.
 
-`HarnessdThreads` toggles the sidebar. Inside the sidebar, `<CR>` opens the
-selected linked thread or saved Codex session, `r` refreshes, and `q` closes the
-sidebar. `HarnessdThreadAttach` opens the sidebar in attach mode so pressing
-`<CR>` on a saved session links it to the current line.
-
-The adapter defines `<Plug>` mappings without assigning user keys:
-
-```lua
-vim.keymap.set({ "n", "i" }, "<C-k>", "<Plug>(HarnessdAsk)")
-vim.keymap.set({ "n", "i" }, "<C-i>", "<Plug>(HarnessdInline)")
-vim.keymap.set({ "n", "i", "v" }, "<C-s>", "<Plug>(HarnessdScratch)")
-vim.keymap.set({ "n", "i" }, "<C-l>", "<Plug>(HarnessdComplete)")
-vim.keymap.set({ "n", "i" }, "<leader>h", "<Plug>(HarnessdSettings)")
-vim.keymap.set({ "n", "i" }, "<C-y>", "<Plug>(HarnessdAccept)")
-vim.keymap.set({ "n", "i" }, "<C-e>", "<Plug>(HarnessdDismiss)")
-vim.keymap.set("n", "<leader>ht", "<Plug>(HarnessdThreads)")
-```
-
-Headless UI test:
+## Headless UI Test
 
 ```bash
 nvim --headless -u NONE -l integrations/nvim/tests/headless.lua

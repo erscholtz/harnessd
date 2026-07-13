@@ -3,8 +3,10 @@
 use harnessd::rpc::{
     AnchorsParams, CacheStatus, CodexSessionsParams, CompleteParams, DaemonMetricsSnapshot,
     GenerateParams, InlineParams, InlinePrepareParams, InlinePrepareResult, JsonRpcRequest,
-    JsonRpcResponse, PrefetchParams, RecentProposal, ScratchCreateParams, ScratchCreateResult,
-    StatusResult, ThreadCreateParams, ThreadListParams,
+    JsonRpcResponse, MarkCreateParams, MarkDeleteParams, MarkListParams, MarkStepParams,
+    PrefetchParams, RecentProposal, ScratchCreateParams, ScratchCreateResult, ScratchStorageMode,
+    SettingsUpdateParams, StatusResult, ThreadCreateParams, ThreadExample,
+    ThreadExampleCreateParams, ThreadExampleCreateResult, ThreadListParams,
 };
 
 #[test]
@@ -169,8 +171,8 @@ fn test_scratch_params_and_result_roundtrip() {
     assert_eq!(decoded.reasoning_effort.as_deref(), Some("low"));
 
     let result = ScratchCreateResult {
-        path: "/workspace/scratch/harnessd/demo.rs".to_string(),
-        relative_path: "scratch/harnessd/demo.rs".to_string(),
+        path: "/home/e/.local/share/harnessd/scratch/hash/standalone/demo.rs".to_string(),
+        relative_path: "scratch/hash/standalone/demo.rs".to_string(),
         bytes: 42,
         lines: 3,
         created_at: 1,
@@ -180,8 +182,53 @@ fn test_scratch_params_and_result_roundtrip() {
     let json = serde_json::to_string(&result).expect("failed to serialize scratch result");
     let decoded: ScratchCreateResult =
         serde_json::from_str(&json).expect("failed to deserialize scratch result");
-    assert_eq!(decoded.relative_path, "scratch/harnessd/demo.rs");
+    assert_eq!(decoded.relative_path, "scratch/hash/standalone/demo.rs");
     assert_eq!(decoded.bytes, 42);
+}
+
+#[test]
+fn test_settings_params_roundtrip() {
+    let params = SettingsUpdateParams {
+        scratch_storage_mode: Some(ScratchStorageMode::Temp),
+        read_scope: Some(harnessd::rpc::ReadScope::CurrentContext),
+    };
+    let json = serde_json::to_string(&params).expect("failed to serialize settings params");
+    assert!(json.contains("temp"));
+    assert!(json.contains("current_context"));
+    let decoded: SettingsUpdateParams =
+        serde_json::from_str(&json).expect("failed to deserialize settings params");
+    assert_eq!(decoded.scratch_storage_mode, Some(ScratchStorageMode::Temp));
+}
+
+#[test]
+fn test_mark_params_roundtrip() {
+    let create = MarkCreateParams {
+        workspace: "/workspace".to_string(),
+        file: "/workspace/src/main.rs".to_string(),
+        offset: 12,
+        content: "fn main() {}".to_string(),
+        thread_id: Some("thread-1".to_string()),
+    };
+    let json = serde_json::to_string(&create).expect("failed to serialize mark create");
+    let decoded: MarkCreateParams =
+        serde_json::from_str(&json).expect("failed to deserialize mark create");
+    assert_eq!(decoded.thread_id.as_deref(), Some("thread-1"));
+
+    let list: MarkListParams =
+        serde_json::from_str(r#"{"workspace":"/workspace","file":"/workspace/src/main.rs"}"#)
+            .expect("failed to deserialize mark list");
+    assert_eq!(list.content, None);
+
+    let delete: MarkDeleteParams =
+        serde_json::from_str(r#"{"mark_id":"mark-1","delete_attached_thread":true}"#)
+            .expect("failed to deserialize mark delete");
+    assert!(delete.delete_attached_thread);
+
+    let step: MarkStepParams = serde_json::from_str(
+        r#"{"workspace":"/workspace","file":"/workspace/src/main.rs","current_line":3}"#,
+    )
+    .expect("failed to deserialize mark step");
+    assert_eq!(step.current_line, 3);
 }
 
 #[test]
@@ -224,6 +271,74 @@ fn test_thread_params_roundtrip() {
         serde_json::from_str(r#"{"workspace":"/workspace","file":"/workspace/src/main.rs"}"#)
             .expect("failed to deserialize thread list");
     assert_eq!(list.content, None);
+}
+
+#[test]
+fn test_thread_example_params_and_result_roundtrip() {
+    let params = ThreadExampleCreateParams {
+        thread_id: "thread-1".to_string(),
+        workspace: "/workspace".to_string(),
+        file: "/workspace/src/main.rs".to_string(),
+        offset: 12,
+        content: "fn main() {}".to_string(),
+        prompt: "show usage".to_string(),
+        selection_start: Some(1),
+        selection_end: Some(5),
+        model: Some("gpt-5.5".to_string()),
+        reasoning_effort: Some("high".to_string()),
+    };
+    let json = serde_json::to_string(&params).expect("failed to serialize thread example params");
+    let decoded: ThreadExampleCreateParams =
+        serde_json::from_str(&json).expect("failed to deserialize thread example params");
+    assert_eq!(decoded.thread_id, "thread-1");
+    assert_eq!(decoded.offset, 12);
+    assert_eq!(decoded.selection_start, Some(1));
+    assert_eq!(decoded.model.as_deref(), Some("gpt-5.5"));
+
+    let thread: harnessd::rpc::ThreadAnchor = serde_json::from_str(
+        r#"{
+            "thread_id":"thread-1",
+            "workspace":"/workspace",
+            "file":"/workspace/src/main.rs",
+            "original_line":1,
+            "current_line":1,
+            "byte_offset":0,
+            "line_hash":"hash",
+            "line_preview":"fn main() {}",
+            "prompt_preview":"ask",
+            "prompt":"ask",
+            "status":"open",
+            "created_at":1,
+            "updated_at":1
+        }"#,
+    )
+    .expect("old thread shape should deserialize");
+    assert!(thread.examples.is_empty());
+
+    let example = ThreadExample {
+        example_id: "example-1".to_string(),
+        thread_id: "thread-1".to_string(),
+        title: "show usage".to_string(),
+        path: "/home/e/.local/share/harnessd/scratch/hash/thread-1/demo.rs".to_string(),
+        relative_path: "scratch/hash/thread-1/demo.rs".to_string(),
+        prompt: "show usage".to_string(),
+        prompt_preview: "show usage".to_string(),
+        source_file: "/workspace/src/main.rs".to_string(),
+        bytes: 42,
+        lines: 3,
+        created_at: 2,
+    };
+    let result = ThreadExampleCreateResult {
+        thread,
+        example: example.clone(),
+    };
+    let json = serde_json::to_string(&result).expect("failed to serialize thread example result");
+    let decoded: ThreadExampleCreateResult =
+        serde_json::from_str(&json).expect("failed to deserialize thread example result");
+    assert_eq!(
+        decoded.example.relative_path,
+        "scratch/hash/thread-1/demo.rs"
+    );
 }
 
 #[test]

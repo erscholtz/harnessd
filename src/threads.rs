@@ -89,11 +89,48 @@ pub struct ThreadAttachParams {
     pub codex_session_id: String,
 }
 
+/// Parameters for deleting a thread and its scratch artifacts.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ThreadDeleteParams {
+    /// Thread id.
+    pub thread_id: String,
+}
+
+/// A generated example artifact linked to a thread.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ThreadExample {
+    /// Stable harnessd example id.
+    pub example_id: String,
+    /// Parent thread id.
+    pub thread_id: String,
+    /// Display title for the example.
+    pub title: String,
+    /// Absolute artifact path.
+    pub path: String,
+    /// Workspace-relative artifact path.
+    pub relative_path: String,
+    /// Full user prompt used to create the example.
+    pub prompt: String,
+    /// Bounded prompt preview.
+    pub prompt_preview: String,
+    /// Absolute source file path used as context.
+    pub source_file: String,
+    /// Number of bytes written.
+    pub bytes: usize,
+    /// Number of lines written.
+    pub lines: usize,
+    /// Creation timestamp as Unix seconds.
+    pub created_at: u64,
+}
+
 /// Persistent thread anchor.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ThreadAnchor {
     /// Stable harnessd thread id.
     pub thread_id: String,
+    /// Optional external mark id this thread is attached to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mark_id: Option<String>,
     /// Workspace root.
     pub workspace: String,
     /// Source file path.
@@ -124,6 +161,9 @@ pub struct ThreadAnchor {
     /// Optional Codex session JSONL path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex_session_path: Option<String>,
+    /// Example artifacts generated for this thread.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<ThreadExample>,
     /// `open`, `linked`, or `stale`.
     pub status: String,
     /// Creation timestamp as Unix seconds.
@@ -172,6 +212,15 @@ pub struct ThreadLinkResult {
     pub thread: ThreadAnchor,
 }
 
+/// Result of creating and linking a thread example.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ThreadExampleCreateResult {
+    /// Updated thread.
+    pub thread: ThreadAnchor,
+    /// Linked example artifact.
+    pub example: ThreadExample,
+}
+
 /// Result of resolving a session link.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ThreadResolveResult {
@@ -179,6 +228,13 @@ pub struct ThreadResolveResult {
     pub thread: Option<ThreadAnchor>,
     /// Whether a matching Codex session was found.
     pub resolved: bool,
+}
+
+/// Result of deleting a thread.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ThreadDeleteResult {
+    /// Deleted thread, if it existed.
+    pub thread: Option<ThreadAnchor>,
 }
 
 /// JSON-backed thread store.
@@ -195,6 +251,15 @@ impl ThreadStore {
 
     /// Create an anchored thread.
     pub fn create(&self, params: &ThreadCreateParams) -> anyhow::Result<ThreadCreateResult> {
+        self.create_with_mark(params, None)
+    }
+
+    /// Create an anchored thread attached to an optional external mark.
+    pub fn create_with_mark(
+        &self,
+        params: &ThreadCreateParams,
+        mark_id: Option<String>,
+    ) -> anyhow::Result<ThreadCreateResult> {
         validate_offset(&params.content, params.offset)?;
         if params.prompt.trim().is_empty() {
             anyhow::bail!("thread prompt must not be empty");
@@ -210,6 +275,7 @@ impl ThreadStore {
             crate::models::normalize_reasoning_effort(params.reasoning_effort.clone())?;
         let thread = ThreadAnchor {
             thread_id: new_thread_id(),
+            mark_id,
             workspace: workspace.display().to_string(),
             file: file.display().to_string(),
             original_line: line,
@@ -223,6 +289,7 @@ impl ThreadStore {
             reasoning_effort,
             codex_session_id: None,
             codex_session_path: None,
+            examples: Vec::new(),
             status: "open".to_string(),
             created_at: now,
             updated_at: now,
@@ -236,6 +303,41 @@ impl ThreadStore {
             params.selection_end,
         );
         Ok(ThreadCreateResult { thread, launch })
+    }
+
+    /// Link a generated scratch artifact to an existing thread.
+    pub fn add_example(
+        &self,
+        thread_id: &str,
+        scratch: &crate::rpc::ScratchCreateResult,
+        prompt: &str,
+    ) -> anyhow::Result<ThreadExampleCreateResult> {
+        let mut threads = self.load()?;
+        let Some(thread) = threads
+            .iter_mut()
+            .find(|thread| thread.thread_id == thread_id)
+        else {
+            anyhow::bail!("thread not found: {thread_id}");
+        };
+        let prompt = prompt.trim();
+        let example = ThreadExample {
+            example_id: new_example_id(),
+            thread_id: thread_id.to_string(),
+            title: title_for_example(prompt, &scratch.relative_path),
+            path: scratch.path.clone(),
+            relative_path: scratch.relative_path.clone(),
+            prompt: prompt.to_string(),
+            prompt_preview: truncate(prompt, PROMPT_PREVIEW_MAX_CHARS),
+            source_file: scratch.source_file.clone(),
+            bytes: scratch.bytes,
+            lines: scratch.lines,
+            created_at: scratch.created_at,
+        };
+        thread.examples.push(example.clone());
+        thread.updated_at = unix_timestamp();
+        let thread = thread.clone();
+        self.save(&threads)?;
+        Ok(ThreadExampleCreateResult { thread, example })
     }
 
     /// List threads, optionally filtered and reanchored against live content.
@@ -336,6 +438,22 @@ impl ThreadStore {
         Ok(ThreadResolveResult {
             thread: Some(linked.thread),
             resolved: true,
+        })
+    }
+
+    /// Delete a thread by id.
+    pub fn delete(&self, params: &ThreadDeleteParams) -> anyhow::Result<ThreadDeleteResult> {
+        let mut threads = self.load()?;
+        let Some(index) = threads
+            .iter()
+            .position(|thread| thread.thread_id == params.thread_id)
+        else {
+            return Ok(ThreadDeleteResult { thread: None });
+        };
+        let thread = threads.remove(index);
+        self.save(&threads)?;
+        Ok(ThreadDeleteResult {
+            thread: Some(thread),
         })
     }
 
@@ -527,6 +645,27 @@ fn new_thread_id() -> String {
     )
 }
 
+fn new_example_id() -> String {
+    format!(
+        "example-{}-{}-{}",
+        unix_millis(),
+        std::process::id(),
+        THREAD_COUNTER.fetch_add(1, Ordering::SeqCst)
+    )
+}
+
+fn title_for_example(prompt: &str, relative_path: &str) -> String {
+    let prompt = prompt.trim();
+    if !prompt.is_empty() {
+        return truncate(prompt, PROMPT_PREVIEW_MAX_CHARS);
+    }
+    Path::new(relative_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("example")
+        .to_string()
+}
+
 fn unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -631,5 +770,87 @@ mod tests {
         assert_eq!(listed.threads[0].thread_id, created.thread.thread_id);
         assert_eq!(listed.threads[0].status, "stale");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn persists_examples_and_preserves_them_on_reanchor() {
+        let (store, dir) = store();
+        let file = dir.join("main.rs");
+        let content = "fn a() {}\nlet target = 1;\n";
+        let created = store
+            .create(&ThreadCreateParams {
+                workspace: dir.display().to_string(),
+                file: file.display().to_string(),
+                offset: content.find("target").unwrap(),
+                content: content.to_string(),
+                prompt: "explain target".to_string(),
+                selection_start: None,
+                selection_end: None,
+                model: None,
+                reasoning_effort: None,
+            })
+            .unwrap();
+        let linked = store
+            .add_example(
+                &created.thread.thread_id,
+                &crate::rpc::ScratchCreateResult {
+                    path: dir
+                        .join("scratch")
+                        .join("hash")
+                        .join("thread")
+                        .join("demo.rs")
+                        .display()
+                        .to_string(),
+                    relative_path: "scratch/hash/thread/demo.rs".to_string(),
+                    bytes: 42,
+                    lines: 3,
+                    created_at: 2,
+                    source_file: file.display().to_string(),
+                    prompt_preview: "show usage".to_string(),
+                },
+                "show usage",
+            )
+            .unwrap();
+        assert_eq!(linked.thread.examples.len(), 1);
+        assert_eq!(linked.example.title, "show usage");
+
+        let shifted = "prep();\nfn a() {}\nlet target = 1;\n";
+        let listed = store
+            .list(&ThreadListParams {
+                workspace: dir.display().to_string(),
+                file: Some(file.display().to_string()),
+                content: Some(shifted.to_string()),
+            })
+            .unwrap();
+        assert_eq!(listed.threads[0].current_line, 3);
+        assert_eq!(listed.threads[0].examples.len(), 1);
+        assert_eq!(
+            listed.threads[0].examples[0].relative_path,
+            "scratch/hash/thread/demo.rs"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn old_thread_json_without_examples_defaults_to_empty() {
+        let thread: ThreadAnchor = serde_json::from_str(
+            r#"{
+                "thread_id":"thread-1",
+                "workspace":"/workspace",
+                "file":"/workspace/src/main.rs",
+                "original_line":1,
+                "current_line":1,
+                "byte_offset":0,
+                "line_hash":"hash",
+                "line_preview":"fn main() {}",
+                "prompt_preview":"ask",
+                "prompt":"ask",
+                "status":"open",
+                "created_at":1,
+                "updated_at":1
+            }"#,
+        )
+        .unwrap();
+        assert!(thread.examples.is_empty());
     }
 }

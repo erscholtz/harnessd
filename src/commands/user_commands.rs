@@ -8,14 +8,17 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-use crate::cli::{Commands, ThreadCommands};
+use crate::cli::{
+    Commands, MarkCommands, ReadScopeArg, ScratchStorageModeArg, SettingsCommands, ThreadCommands,
+};
 use crate::daemon_lock::{DaemonLock, read_daemon_pid};
 use crate::paths;
 use crate::rpc::{
     AnchorsParams, CodexSessionsParams, CompleteParams, GenerateParams, InlineFastParams,
-    InlineParams, InlinePrepareParams, JsonRpcRequest, PrefetchParams, PrefetchResult,
-    ScratchCreateParams, StatusResult, ThreadAttachParams, ThreadCreateParams, ThreadLinkParams,
-    ThreadListParams, ThreadResolveParams,
+    InlineParams, InlinePrepareParams, JsonRpcRequest, MarkCreateParams, MarkDeleteParams,
+    MarkListParams, MarkStepParams, PrefetchParams, PrefetchResult, ScratchCreateParams,
+    SettingsUpdateParams, StatusResult, ThreadAttachParams, ThreadCreateParams, ThreadDeleteParams,
+    ThreadExampleCreateParams, ThreadLinkParams, ThreadListParams, ThreadResolveParams,
 };
 use crate::runtime;
 
@@ -79,6 +82,8 @@ pub async fn run(command: Commands) -> anyhow::Result<()> {
             limit,
         } => run_codex_sessions(&workspace, all, limit).await,
         Commands::Thread { command } => run_thread(command).await,
+        Commands::Mark { command } => run_mark(command).await,
+        Commands::Settings { command } => run_settings(command).await,
         Commands::Research { query, manual } => run_research(&query, manual.as_deref()).await,
         Commands::Bridge {
             method,
@@ -561,8 +566,200 @@ async fn run_thread(command: ThreadCommands) -> anyhow::Result<()> {
             )?;
             println!("{}", send_rpc_request(&request).await?);
         }
+        ThreadCommands::Example {
+            thread_id,
+            workspace,
+            file,
+            offset,
+            prompt,
+            selection_start,
+            selection_end,
+            model,
+            reasoning_effort,
+        } => {
+            let content = read_stdin_optional().await?;
+            if content.is_empty() {
+                anyhow::bail!("`thread example` requires live buffer contents on stdin");
+            }
+            let request = build_thread_example_request(
+                &thread_id,
+                &workspace,
+                &file,
+                offset,
+                &prompt,
+                content,
+                selection_start,
+                selection_end,
+                model.as_deref(),
+                reasoning_effort.as_deref(),
+            )?;
+            println!("{}", send_rpc_request(&request).await?);
+        }
+        ThreadCommands::Delete { thread_id } => {
+            let request = rpc_request("thread.delete", Some(ThreadDeleteParams { thread_id }))?;
+            println!("{}", send_rpc_request(&request).await?);
+        }
     }
     Ok(())
+}
+
+async fn run_mark(command: MarkCommands) -> anyhow::Result<()> {
+    match command {
+        MarkCommands::Create {
+            workspace,
+            file,
+            offset,
+            thread_id,
+        } => {
+            let content = read_stdin_optional().await?;
+            if content.is_empty() {
+                anyhow::bail!("`mark create` requires live buffer contents on stdin");
+            }
+            let request = rpc_request(
+                "mark.create",
+                Some(MarkCreateParams {
+                    workspace: canonicalize_rpc_path(&workspace)?,
+                    file: canonicalize_rpc_path(&file)?,
+                    offset,
+                    content,
+                    thread_id,
+                }),
+            )?;
+            println!("{}", send_rpc_request(&request).await?);
+        }
+        MarkCommands::List { workspace, file } => {
+            let content = read_stdin_optional().await?;
+            let request = rpc_request(
+                "mark.list",
+                Some(MarkListParams {
+                    workspace: canonicalize_rpc_path(&workspace)?,
+                    file: file.as_deref().map(canonicalize_rpc_path).transpose()?,
+                    content: (!content.is_empty()).then_some(content),
+                }),
+            )?;
+            println!("{}", send_rpc_request(&request).await?);
+        }
+        MarkCommands::Delete {
+            mark_id,
+            delete_attached_thread,
+        } => {
+            let request = rpc_request(
+                "mark.delete",
+                Some(MarkDeleteParams {
+                    mark_id,
+                    delete_attached_thread,
+                }),
+            )?;
+            println!("{}", send_rpc_request(&request).await?);
+        }
+        MarkCommands::Next {
+            workspace,
+            file,
+            current_line,
+        } => {
+            let request =
+                build_mark_step_request("mark.next", &workspace, &file, current_line).await?;
+            println!("{}", send_rpc_request(&request).await?);
+        }
+        MarkCommands::Prev {
+            workspace,
+            file,
+            current_line,
+        } => {
+            let request =
+                build_mark_step_request("mark.prev", &workspace, &file, current_line).await?;
+            println!("{}", send_rpc_request(&request).await?);
+        }
+    }
+    Ok(())
+}
+
+async fn build_mark_step_request(
+    method: &str,
+    workspace: &Path,
+    file: &Path,
+    current_line: usize,
+) -> anyhow::Result<JsonRpcRequest> {
+    let content = read_stdin_optional().await?;
+    rpc_request(
+        method,
+        Some(MarkStepParams {
+            workspace: canonicalize_rpc_path(workspace)?,
+            file: canonicalize_rpc_path(file)?,
+            current_line,
+            content: (!content.is_empty()).then_some(content),
+        }),
+    )
+}
+
+async fn run_settings(command: SettingsCommands) -> anyhow::Result<()> {
+    match command {
+        SettingsCommands::Get => {
+            let request = rpc_request::<serde_json::Value>("settings.get", None)?;
+            println!("{}", send_rpc_request(&request).await?);
+        }
+        SettingsCommands::Update {
+            scratch_storage_mode,
+            read_scope,
+        } => {
+            let request = rpc_request(
+                "settings.update",
+                Some(SettingsUpdateParams {
+                    scratch_storage_mode: scratch_storage_mode.map(|mode| match mode {
+                        ScratchStorageModeArg::Runtime => {
+                            crate::settings::ScratchStorageMode::Runtime
+                        }
+                        ScratchStorageModeArg::Temp => crate::settings::ScratchStorageMode::Temp,
+                    }),
+                    read_scope: read_scope.map(|scope| match scope {
+                        ReadScopeArg::CurrentContext => crate::settings::ReadScope::CurrentContext,
+                    }),
+                }),
+            )?;
+            println!("{}", send_rpc_request(&request).await?);
+        }
+    }
+    Ok(())
+}
+
+fn build_thread_example_request(
+    thread_id: &str,
+    workspace: &Path,
+    file: &Path,
+    offset: usize,
+    prompt: &str,
+    content: String,
+    selection_start: Option<usize>,
+    selection_end: Option<usize>,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+) -> anyhow::Result<JsonRpcRequest> {
+    if thread_id.trim().is_empty() {
+        anyhow::bail!("`--thread-id` must not be empty for `thread example`");
+    }
+    if prompt.trim().is_empty() {
+        anyhow::bail!("`--prompt` must not be empty for `thread example`");
+    }
+    if content.is_empty() {
+        anyhow::bail!("`thread example` requires live buffer contents on stdin");
+    }
+    rpc_request(
+        "thread.example.create",
+        Some(ThreadExampleCreateParams {
+            thread_id: thread_id.to_string(),
+            workspace: canonicalize_rpc_path(workspace)?,
+            file: canonicalize_rpc_path(file)?,
+            offset,
+            content,
+            prompt: prompt.to_string(),
+            selection_start,
+            selection_end,
+            model: crate::models::normalize_model(model.map(str::to_string))?,
+            reasoning_effort: crate::models::normalize_reasoning_effort(
+                reasoning_effort.map(str::to_string),
+            )?,
+        }),
+    )
 }
 
 async fn run_bridge(
@@ -980,10 +1177,13 @@ fn canonicalize_rpc_path(path: &Path) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_bridge_request, build_inline_request, build_scratch_request};
+    use super::{
+        build_bridge_request, build_inline_request, build_scratch_request,
+        build_thread_example_request,
+    };
     use crate::rpc::{
         CompleteParams, GenerateParams, InlineFastParams, InlineParams, InlinePrepareParams,
-        PrefetchParams, ScratchCreateParams,
+        PrefetchParams, ScratchCreateParams, ThreadExampleCreateParams,
     };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1285,6 +1485,39 @@ mod tests {
             )
             .is_err()
         );
+
+        std::fs::remove_file(&file).ok();
+        std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();
+    }
+
+    #[test]
+    fn thread_example_builds_request_from_live_buffer_content() {
+        let file = temp_file_path("fixture.rs");
+        let workspace = file.parent().unwrap().to_path_buf();
+        let request = build_thread_example_request(
+            "thread-1",
+            &workspace,
+            &file,
+            7,
+            "show usage",
+            "fn unsaved() {}".into(),
+            Some(1),
+            Some(5),
+            Some("gpt-5.4-mini"),
+            Some("low"),
+        )
+        .expect("failed to build thread example request");
+        assert_eq!(request.method, "thread.example.create");
+        let params: ThreadExampleCreateParams =
+            serde_json::from_value(request.params.expect("missing params")).expect("bad params");
+        assert_eq!(params.thread_id, "thread-1");
+        assert_eq!(params.offset, 7);
+        assert_eq!(params.prompt, "show usage");
+        assert_eq!(params.content, "fn unsaved() {}");
+        assert_eq!(params.selection_start, Some(1));
+        assert_eq!(params.selection_end, Some(5));
+        assert_eq!(params.model.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(params.reasoning_effort.as_deref(), Some("low"));
 
         std::fs::remove_file(&file).ok();
         std::fs::remove_dir_all(file.parent().expect("missing parent")).ok();

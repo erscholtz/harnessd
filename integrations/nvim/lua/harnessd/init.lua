@@ -6,12 +6,16 @@ local config = {
   sidebar_width = 72,
   session_limit = 50,
   thread_sign_text = "H",
+  mark_sign_text = "M",
+  scratch_storage_mode = "runtime",
+  read_scope = "current_context",
+  legacy_autocomplete = false,
   auto_inline = false,
   auto_inline_delay_ms = 250,
   fast_inline = true,
   fast_inline_background_refresh = true,
   inline_refresh_indicator_ms = 4000,
-  prepare_context_on_buf_enter = true,
+  prepare_context_on_buf_enter = false,
   inline_completion_prompt = "Complete the code at the cursor with the smallest useful insertion.",
   model_presets = {
     { label = "default", model = nil, reasoning_effort = nil },
@@ -29,12 +33,16 @@ local config = {
 
 local namespace = vim.api.nvim_create_namespace("harnessd_preview")
 local thread_namespace = vim.api.nvim_create_namespace("harnessd_threads")
+local mark_namespace = vim.api.nvim_create_namespace("harnessd_marks")
 local preview = nil
 local prompt = nil
 local sidebar = nil
 local thread_sign_group = "harnessd_threads"
+local mark_sign_group = "harnessd_marks"
 local thread_sign_id = 1000
+local mark_sign_id = 2000
 local current_threads = {}
+local current_marks = {}
 local auto_inline_timer = nil
 local auto_inline_running = false
 local auto_inline_pending = false
@@ -229,6 +237,16 @@ local function sign_define()
     texthl = "DiagnosticWarn",
     numhl = "DiagnosticWarn",
   })
+  pcall(vim.fn.sign_define, "HarnessdMark", {
+    text = config.mark_sign_text,
+    texthl = "DiagnosticHint",
+    numhl = "DiagnosticHint",
+  })
+  pcall(vim.fn.sign_define, "HarnessdMarkStale", {
+    text = config.mark_sign_text,
+    texthl = "DiagnosticWarn",
+    numhl = "DiagnosticWarn",
+  })
 end
 
 local function run_command(args, options, callback)
@@ -402,6 +420,14 @@ function M.toggle_auto_inline()
 end
 
 function M.statusline()
+  if not config.legacy_autocomplete then
+    local marks = 0
+    for _, threads in pairs(current_threads) do
+      marks = marks + #(threads or {})
+    end
+    local mode = sidebar and sidebar.mode or "closed"
+    return "harnessd: [" .. mode .. "] marks: [" .. tostring(marks) .. "]"
+  end
   local context = context_status.state or "idle"
   local inline = "idle"
   if inline_status.state == "failed" then
@@ -1015,6 +1041,166 @@ function M.thread_attach(opts, callback)
   }, { stdin = opts.content or "" }, callback)
 end
 
+function M.thread_example(opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
+  local args = {
+    config.command,
+    "thread",
+    "example",
+    "--thread-id",
+    opts.thread_id,
+    "--workspace",
+    opts.workspace or workspace(),
+    "--file",
+    opts.file,
+    "--offset",
+    tostring(opts.offset),
+    "--prompt",
+    opts.prompt,
+  }
+  if opts.selection_start then
+    table.insert(args, "--selection-start")
+    table.insert(args, tostring(opts.selection_start))
+  end
+  if opts.selection_end then
+    table.insert(args, "--selection-end")
+    table.insert(args, tostring(opts.selection_end))
+  end
+  add_model_args(args, opts.model, opts.reasoning_effort)
+  run_command(args, { stdin = opts.content or "" }, callback)
+end
+
+function M.thread_delete(opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
+  run_command({
+    config.command,
+    "thread",
+    "delete",
+    "--thread-id",
+    opts.thread_id,
+  }, nil, callback)
+end
+
+function M.mark_create(opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
+  local args = {
+    config.command,
+    "mark",
+    "create",
+    "--workspace",
+    opts.workspace or workspace(),
+    "--file",
+    opts.file,
+    "--offset",
+    tostring(opts.offset),
+  }
+  if opts.thread_id then
+    table.insert(args, "--thread-id")
+    table.insert(args, opts.thread_id)
+  end
+  run_command(args, { stdin = opts.content or "" }, callback)
+end
+
+function M.mark_list(opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
+  local args = {
+    config.command,
+    "mark",
+    "list",
+    "--workspace",
+    opts.workspace or workspace(),
+  }
+  if opts.file then
+    table.insert(args, "--file")
+    table.insert(args, opts.file)
+  end
+  run_command(args, { stdin = opts.content or "" }, callback)
+end
+
+function M.mark_delete(opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
+  local args = {
+    config.command,
+    "mark",
+    "delete",
+    "--mark-id",
+    opts.mark_id,
+  }
+  if opts.delete_attached_thread then
+    table.insert(args, "--delete-attached-thread")
+  end
+  run_command(args, nil, callback)
+end
+
+local function mark_step(method, opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
+  local args = {
+    config.command,
+    "mark",
+    method,
+    "--workspace",
+    opts.workspace or workspace(),
+    "--file",
+    opts.file,
+    "--current-line",
+    tostring(opts.current_line),
+  }
+  run_command(args, { stdin = opts.content or "" }, callback)
+end
+
+function M.mark_next(opts, callback)
+  return mark_step("next", opts, callback)
+end
+
+function M.mark_prev(opts, callback)
+  return mark_step("prev", opts, callback)
+end
+
+function M.settings_get(callback)
+  callback = callback or function() end
+  run_command({
+    config.command,
+    "settings",
+    "get",
+  }, nil, callback)
+end
+
+function M.settings_update(opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
+  local args = {
+    config.command,
+    "settings",
+    "update",
+  }
+  if opts.scratch_storage_mode then
+    table.insert(args, "--scratch-storage-mode")
+    table.insert(args, opts.scratch_storage_mode)
+  end
+  if opts.read_scope then
+    table.insert(args, "--read-scope")
+    table.insert(args, opts.read_scope)
+  end
+  run_command(args, nil, function(response, err)
+    if not err then
+      local settings = (((response or {}).result or {}).settings) or {}
+      if settings.scratch_storage_mode then
+        config.scratch_storage_mode = settings.scratch_storage_mode
+      end
+      if settings.read_scope then
+        config.read_scope = settings.read_scope
+      end
+    end
+    callback(response, err)
+  end)
+end
+
 function M.suggestions_to_complete_items(response)
   local suggestions = (((response or {}).result or {}).suggestions) or {}
   local items = {}
@@ -1174,9 +1360,15 @@ local function ensure_sidebar()
     items = {},
     terminal_buffers = {},
     active_terminal = nil,
+    active_thread = nil,
+    source_bufnr = nil,
+    example_bufnr = nil,
     attach = nil,
   }
   vim.keymap.set("n", "<CR>", function() M.sidebar_open_selected() end, { buffer = bufnr, nowait = true })
+  vim.keymap.set("n", "<Tab>", function() M.panel_flip() end, { buffer = bufnr, nowait = true })
+  vim.keymap.set("n", "e", function() M.example_ask() end, { buffer = bufnr, nowait = true })
+  vim.keymap.set("n", "g", function() M.jump_to_thread() end, { buffer = bufnr, nowait = true })
   vim.keymap.set("n", "q", function() M.sidebar_toggle() end, { buffer = bufnr, nowait = true })
   vim.keymap.set("n", "r", function() M.sidebar_refresh() end, { buffer = bufnr, nowait = true })
   return winid, bufnr
@@ -1185,18 +1377,31 @@ end
 local function render_sidebar(items, title)
   local _, bufnr = ensure_sidebar()
   sidebar.items = items or {}
+  sidebar.rows = {}
   local lines = { title or "harnessd threads", "" }
   if #sidebar.items == 0 then
     lines[#lines + 1] = "No Codex sessions or anchored threads yet."
   end
   for index, item in ipairs(sidebar.items) do
-    if item.kind == "thread" then
+    if item.kind == "mark" then
+      local marker = item.mark.status == "stale" and "!" or "M"
+      local thread = item.mark.thread_id and (" -> " .. item.mark.thread_id) or ""
+      sidebar.rows[#lines + 1] = item
+      lines[#lines + 1] = string.format("%2d. [%s] %s:%s %s%s", index, marker, vim.fn.fnamemodify(item.mark.file, ":t"), item.mark.current_line, item.mark.line_preview or "", thread)
+    elseif item.kind == "thread" then
       local marker = item.thread.status == "stale" and "!" or "H"
       local session = item.thread.codex_session_id and (" -> " .. item.thread.codex_session_id) or ""
-      lines[#lines + 1] = string.format("%2d. [%s] %s:%s %s%s", index, marker, vim.fn.fnamemodify(item.thread.file, ":t"), item.thread.current_line, item.thread.prompt_preview or "", session)
+      local examples = item.thread.examples and #item.thread.examples or 0
+      local suffix = examples > 0 and (" examples:" .. examples) or ""
+      sidebar.rows[#lines + 1] = item
+      lines[#lines + 1] = string.format("%2d. [%s] %s:%s %s%s%s", index, marker, vim.fn.fnamemodify(item.thread.file, ":t"), item.thread.current_line, item.thread.prompt_preview or "", session, suffix)
+    elseif item.kind == "example" then
+      sidebar.rows[#lines + 1] = item
+      lines[#lines + 1] = string.format("%2d. [E] %s  %s", index, item.example.relative_path or item.example.path or "", item.example.prompt_preview or item.example.title or "")
     elseif item.kind == "session" then
       local preview = item.session.preview or item.session.cwd or ""
       local star = item.session.project_match and "*" or " "
+      sidebar.rows[#lines + 1] = item
       lines[#lines + 1] = string.format("%2d. [%s] %s  %s", index, star, item.session.id, preview)
     end
   end
@@ -1228,6 +1433,7 @@ local function launch_codex(launch)
     cwd = launch.cwd,
     bufnr = term_bufnr,
   }
+  sidebar.mode = "chat"
   vim.cmd("startinsert")
   return term_bufnr, bufnr
 end
@@ -1244,6 +1450,86 @@ local function launch_session(session, prompt_text)
   end
   local launch = { argv = argv, cwd = session.cwd or workspace(), started_after_unix = os.time() }
   return launch_codex(launch)
+end
+
+local function current_thread_at_cursor(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  for _, thread in ipairs(current_threads[bufnr] or {}) do
+    if thread.current_line == cursor[1] then
+      return thread
+    end
+  end
+  return nil
+end
+
+local function render_thread_examples(thread)
+  local _, bufnr = ensure_sidebar()
+  sidebar.mode = "examples"
+  sidebar.active_thread = thread
+  sidebar.items = {}
+  sidebar.rows = {}
+  local lines = {
+    "harnessd examples",
+    "",
+    (thread and (vim.fn.fnamemodify(thread.file or "", ":t") .. ":" .. tostring(thread.current_line or "?") .. " " .. (thread.prompt_preview or ""))) or "No active thread.",
+    "",
+  }
+  if not thread or not thread.examples or #thread.examples == 0 then
+    lines[#lines + 1] = "No linked examples yet. Press e to create one."
+  else
+    for index, example in ipairs(thread.examples) do
+      sidebar.items[#sidebar.items + 1] = { kind = "example", example = example, thread = thread }
+      sidebar.rows[#lines + 1] = sidebar.items[#sidebar.items]
+      lines[#lines + 1] = string.format("%2d. [E] %s  %s", index, example.relative_path or example.path or "", example.prompt_preview or example.title or "")
+    end
+  end
+  vim.bo[bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  vim.bo[bufnr].modifiable = false
+  vim.api.nvim_win_set_buf(sidebar.winid, bufnr)
+end
+
+local function preview_example(example)
+  if not example or not example.path then
+    return
+  end
+  local _, panel_bufnr = ensure_sidebar()
+  local bufnr = sidebar.example_bufnr
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    bufnr = vim.api.nvim_create_buf(false, true)
+    sidebar.example_bufnr = bufnr
+    vim.bo[bufnr].buftype = "nofile"
+    vim.bo[bufnr].bufhidden = "hide"
+    vim.bo[bufnr].swapfile = false
+  end
+  local lines = vim.fn.readfile(example.path)
+  vim.bo[bufnr].modifiable = true
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  vim.bo[bufnr].modifiable = false
+  vim.api.nvim_buf_set_name(bufnr, "harnessd://" .. (example.relative_path or example.path))
+  vim.api.nvim_win_set_buf(sidebar.winid, bufnr)
+  sidebar.mode = "example-preview"
+  sidebar.items = {}
+  return bufnr, panel_bufnr
+end
+
+local function set_active_thread(thread, source_bufnr)
+  ensure_sidebar()
+  sidebar.active_thread = thread
+  sidebar.source_bufnr = source_bufnr or sidebar.source_bufnr or vim.api.nvim_get_current_buf()
+end
+
+local function open_thread_panel(thread, source_bufnr)
+  set_active_thread(thread, source_bufnr)
+  sidebar.mode = "chat"
+  if thread and thread.codex_session_id then
+    launch_session({ id = thread.codex_session_id, cwd = thread.workspace }, nil)
+  elseif sidebar.active_terminal and sidebar.active_terminal.bufnr and vim.api.nvim_buf_is_valid(sidebar.active_terminal.bufnr) then
+    vim.api.nvim_win_set_buf(sidebar.winid, sidebar.active_terminal.bufnr)
+  else
+    render_thread_examples(thread)
+  end
 end
 
 function M.send_model_to_active_thread(model)
@@ -1300,15 +1586,23 @@ function render_settings_window()
     lines[#lines + 1] = string.format("%-8s %s", role, model_label(models[role]))
   end
   lines[#lines + 1] = ""
-  lines[#lines + 1] = "behavior"
-  rows[#lines + 1] = { kind = "toggle", key = "auto_inline" }
-  lines[#lines + 1] = string.format("%-16s %s", "auto inline", config.auto_inline and "on" or "off")
-  rows[#lines + 1] = { kind = "toggle", key = "prepare_context_on_buf_enter" }
-  lines[#lines + 1] = string.format(
-    "%-16s %s",
-    "prepare context",
-    config.prepare_context_on_buf_enter and "on" or "off"
-  )
+  lines[#lines + 1] = "scratch"
+  rows[#lines + 1] = { kind = "setting", key = "scratch_storage_mode" }
+  lines[#lines + 1] = string.format("%-16s %s", "storage", config.scratch_storage_mode or "runtime")
+  rows[#lines + 1] = { kind = "status" }
+  lines[#lines + 1] = string.format("%-16s %s", "read scope", config.read_scope or "current_context")
+  if config.legacy_autocomplete then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "behavior"
+    rows[#lines + 1] = { kind = "toggle", key = "auto_inline" }
+    lines[#lines + 1] = string.format("%-16s %s", "auto inline", config.auto_inline and "on" or "off")
+    rows[#lines + 1] = { kind = "toggle", key = "prepare_context_on_buf_enter" }
+    lines[#lines + 1] = string.format(
+      "%-16s %s",
+      "prepare context",
+      config.prepare_context_on_buf_enter and "on" or "off"
+    )
+  end
   lines[#lines + 1] = ""
   lines[#lines + 1] = "status"
   rows[#lines + 1] = { kind = "status" }
@@ -1351,6 +1645,14 @@ local function change_setting(setting)
   end
   if setting.kind == "model" then
     choose_model_for_role(setting.role)
+  elseif setting.kind == "setting" and setting.key == "scratch_storage_mode" then
+    local next_mode = config.scratch_storage_mode == "temp" and "runtime" or "temp"
+    M.settings_update({ scratch_storage_mode = next_mode }, function(_, err)
+      if err then
+        vim.notify(err, vim.log.levels.ERROR)
+      end
+      render_settings_window()
+    end)
   elseif setting.kind == "toggle" then
     if setting.key == "auto_inline" then
       M.set_auto_inline(not config.auto_inline)
@@ -1368,6 +1670,13 @@ local function reset_setting(setting)
   end
   if setting.kind == "model" then
     M.set_model(setting.role, config.model_roles[setting.role], settings_window.source_bufnr)
+  elseif setting.kind == "setting" and setting.key == "scratch_storage_mode" then
+    M.settings_update({ scratch_storage_mode = "runtime" }, function(_, err)
+      if err then
+        vim.notify(err, vim.log.levels.ERROR)
+      end
+      render_settings_window()
+    end)
   elseif setting.kind == "toggle" then
     if setting.key == "auto_inline" then
       M.set_auto_inline(false)
@@ -1389,7 +1698,7 @@ function M.open_settings(opts)
   vim.bo[bufnr].swapfile = false
   vim.bo[bufnr].filetype = "harnessd-settings"
   local width = math.max(44, math.min(72, vim.o.columns - 6))
-  local height = 11
+  local height = config.legacy_autocomplete and 15 or 12
   local winid = vim.api.nvim_open_win(bufnr, true, {
     relative = "editor",
     row = math.max(1, math.floor((vim.o.lines - height) / 3)),
@@ -1433,8 +1742,13 @@ local function mark_threads(bufnr, threads)
   for _, thread in ipairs(threads or {}) do
     local row = math.max(0, (thread.current_line or 1) - 1)
     local hl = thread.status == "stale" and "DiagnosticWarn" or "DiagnosticInfo"
+    local examples = thread.examples and #thread.examples or 0
+    local label = thread.codex_session_id and "Codex thread" or "Codex ask"
+    if examples > 0 then
+      label = label .. " +" .. tostring(examples)
+    end
     vim.api.nvim_buf_set_extmark(bufnr, thread_namespace, row, 0, {
-      virt_text = { { " " .. (thread.codex_session_id and "Codex thread" or "Codex ask"), hl } },
+      virt_text = { { " " .. label, hl } },
       virt_text_pos = "eol",
     })
     thread_sign_id = thread_sign_id + 1
@@ -1463,29 +1777,142 @@ function M.refresh_thread_marks(bufnr)
   end)
 end
 
+local function mark_source_marks(bufnr, marks)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  sign_define()
+  vim.api.nvim_buf_clear_namespace(bufnr, mark_namespace, 0, -1)
+  pcall(vim.fn.sign_unplace, mark_sign_group, { buffer = bufnr })
+  current_marks[bufnr] = marks or {}
+  for _, mark in ipairs(marks or {}) do
+    local row = math.max(0, (mark.current_line or 1) - 1)
+    local hl = mark.status == "stale" and "DiagnosticWarn" or "DiagnosticHint"
+    local label = mark.thread_id and "harnessd mark +thread" or "harnessd mark"
+    vim.api.nvim_buf_set_extmark(bufnr, mark_namespace, row, 0, {
+      virt_text = { { " " .. label, hl } },
+      virt_text_pos = "eol",
+    })
+    mark_sign_id = mark_sign_id + 1
+    pcall(vim.fn.sign_place, mark_sign_id, mark_sign_group, mark.status == "stale" and "HarnessdMarkStale" or "HarnessdMark", bufnr, {
+      lnum = row + 1,
+      priority = 9,
+    })
+  end
+end
+
+function M.refresh_marks(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local file = select(1, current_file(bufnr))
+  if not file then
+    return
+  end
+  M.mark_list({
+    workspace = workspace(),
+    file = file,
+    content = buffer_content(bufnr),
+  }, function(response, err)
+    if err then
+      return
+    end
+    mark_source_marks(bufnr, (((response or {}).result or {}).marks) or {})
+  end)
+end
+
+local function jump_to_mark(mark)
+  if not mark or not mark.file or not mark.current_line then
+    return false
+  end
+  vim.cmd("edit " .. vim.fn.fnameescape(mark.file))
+  vim.api.nvim_win_set_cursor(0, { mark.current_line, 0 })
+  return true
+end
+
+function M.mark_next_current()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local file, file_err = current_file(bufnr)
+  if not file then
+    vim.notify(file_err, vim.log.levels.ERROR)
+    return false
+  end
+  local line = vim.api.nvim_win_get_cursor(0)[1]
+  M.mark_next({
+    workspace = workspace(),
+    file = file,
+    current_line = line,
+    content = buffer_content(bufnr),
+  }, function(response, err)
+    if err then
+      vim.notify(err, vim.log.levels.ERROR)
+      return
+    end
+    local mark = (((response or {}).result or {}).mark)
+    if not jump_to_mark(mark) then
+      vim.notify("no harnessd marks in file", vim.log.levels.WARN)
+    end
+  end)
+  return true
+end
+
+function M.mark_prev_current()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local file, file_err = current_file(bufnr)
+  if not file then
+    vim.notify(file_err, vim.log.levels.ERROR)
+    return false
+  end
+  local line = vim.api.nvim_win_get_cursor(0)[1]
+  M.mark_prev({
+    workspace = workspace(),
+    file = file,
+    current_line = line,
+    content = buffer_content(bufnr),
+  }, function(response, err)
+    if err then
+      vim.notify(err, vim.log.levels.ERROR)
+      return
+    end
+    local mark = (((response or {}).result or {}).mark)
+    if not jump_to_mark(mark) then
+      vim.notify("no harnessd marks in file", vim.log.levels.WARN)
+    end
+  end)
+  return true
+end
+
 function M.sidebar_refresh(opts)
   opts = opts or {}
   local items = {}
   local source_bufnr = opts.bufnr or vim.api.nvim_get_current_buf()
-  local file = select(1, current_file(source_bufnr))
+  local file = opts.all and nil or select(1, current_file(source_bufnr))
   local content = file and buffer_content(source_bufnr) or ""
-  M.thread_list({
+  ensure_sidebar()
+  sidebar.source_bufnr = source_bufnr
+  sidebar.mode = "browse"
+  M.mark_list({
     workspace = workspace(),
     file = file,
     content = content,
-  }, function(thread_response)
-    for _, thread in ipairs((((thread_response or {}).result or {}).threads) or {}) do
-      items[#items + 1] = { kind = "thread", thread = thread }
+  }, function(mark_response)
+    for _, mark in ipairs((((mark_response or {}).result or {}).marks) or {}) do
+      items[#items + 1] = { kind = "mark", mark = mark }
     end
-    M.codex_sessions({ workspace = workspace(), all = true }, function(session_response, err)
-      if err then
-        vim.notify(err, vim.log.levels.ERROR)
-      else
-        for _, session in ipairs((((session_response or {}).result or {}).sessions) or {}) do
-          items[#items + 1] = { kind = "session", session = session }
-        end
+    M.thread_list({
+      workspace = workspace(),
+      file = file,
+      content = content,
+    }, function(thread_response)
+      for _, thread in ipairs((((thread_response or {}).result or {}).threads) or {}) do
+        items[#items + 1] = { kind = "thread", thread = thread }
       end
-      render_sidebar(items, "harnessd Codex threads  <CR> open  r refresh  q close")
+      M.codex_sessions({ workspace = workspace(), all = true }, function(session_response, err)
+        if err then
+          vim.notify(err, vim.log.levels.ERROR)
+        else
+          for _, session in ipairs((((session_response or {}).result or {}).sessions) or {}) do
+            items[#items + 1] = { kind = "session", session = session }
+          end
+        end
+        render_sidebar(items, "harnessd panel  <CR> open  <Tab> flip  e example  g jump  r refresh  q close")
+      end)
     end)
   end)
 end
@@ -1505,7 +1932,7 @@ function M.sidebar_open_selected()
     return
   end
   local line = vim.api.nvim_win_get_cursor(sidebar.winid)[1]
-  local item = sidebar.items[line - 2]
+  local item = (sidebar.rows and sidebar.rows[line]) or sidebar.items[line - 2]
   if not item then
     return
   end
@@ -1528,16 +1955,158 @@ function M.sidebar_open_selected()
     end)
     return
   end
-  if item.kind == "thread" then
-    local thread = item.thread
-    if thread.codex_session_id then
-      launch_session({ id = thread.codex_session_id, cwd = thread.workspace }, nil)
-    else
-      vim.notify("thread has no linked Codex session yet", vim.log.levels.WARN)
+  if item.kind == "mark" then
+    if item.mark.thread_id then
+      for _, candidate in ipairs(current_threads[sidebar.source_bufnr or 0] or {}) do
+        if candidate.thread_id == item.mark.thread_id then
+          open_thread_panel(candidate, sidebar.source_bufnr)
+          return
+        end
+      end
     end
+    vim.cmd("edit " .. vim.fn.fnameescape(item.mark.file))
+    vim.api.nvim_win_set_cursor(0, { item.mark.current_line, 0 })
+  elseif item.kind == "thread" then
+    local thread = item.thread
+    open_thread_panel(thread, sidebar.source_bufnr)
+  elseif item.kind == "example" then
+    preview_example(item.example)
   elseif item.kind == "session" then
     launch_session(item.session, nil)
   end
+end
+
+function M.panel_flip()
+  ensure_sidebar()
+  if sidebar.mode == "chat" then
+    render_thread_examples(sidebar.active_thread)
+  elseif sidebar.mode == "examples" or sidebar.mode == "example-preview" then
+    M.sidebar_refresh({ bufnr = sidebar.source_bufnr or vim.api.nvim_get_current_buf(), all = true })
+  else
+    sidebar.mode = "chat"
+    if sidebar.active_terminal and sidebar.active_terminal.bufnr and vim.api.nvim_buf_is_valid(sidebar.active_terminal.bufnr) then
+      vim.api.nvim_win_set_buf(sidebar.winid, sidebar.active_terminal.bufnr)
+    else
+      render_thread_examples(sidebar.active_thread)
+    end
+  end
+end
+
+function M.jump_to_thread()
+  local thread = sidebar and sidebar.active_thread
+  if not thread then
+    local line = sidebar and sidebar.winid and vim.api.nvim_win_get_cursor(sidebar.winid)[1]
+    local item = line and ((sidebar.rows and sidebar.rows[line]) or (sidebar.items and sidebar.items[math.max(1, line - 2)]))
+    thread = item and (item.thread or (item.kind == "thread" and item.thread))
+  end
+  if not thread or not thread.file or not thread.current_line then
+    vim.notify("no active harnessd thread to jump to", vim.log.levels.WARN)
+    return false
+  end
+  vim.cmd("edit " .. vim.fn.fnameescape(thread.file))
+  vim.api.nvim_win_set_cursor(0, { thread.current_line, 0 })
+  return true
+end
+
+function M.panel(opts)
+  opts = opts or {}
+  local bufnr = opts.bufnr or vim.api.nvim_get_current_buf()
+  local thread = opts.thread or current_thread_at_cursor(bufnr)
+  if thread then
+    if sidebar and sidebar.active_thread and sidebar.active_thread.thread_id == thread.thread_id and sidebar.winid and vim.api.nvim_win_is_valid(sidebar.winid) then
+      M.panel_flip()
+    else
+      open_thread_panel(thread, bufnr)
+    end
+    return
+  end
+  M.thread_ask({ bufnr = bufnr }, opts.callback)
+end
+
+function M.example_ask(opts, callback)
+  opts = opts or {}
+  callback = callback or function() end
+  M.dismiss()
+  local source_bufnr = opts.bufnr or sidebar and sidebar.source_bufnr or vim.api.nvim_get_current_buf()
+  if not vim.api.nvim_buf_is_valid(source_bufnr) then
+    source_bufnr = vim.api.nvim_get_current_buf()
+  end
+  local thread = opts.thread or (sidebar and sidebar.active_thread) or current_thread_at_cursor(source_bufnr)
+  if not thread then
+    vim.notify("create or select a harnessd thread before adding an example", vim.log.levels.WARN)
+    callback(nil, "no active thread")
+    return
+  end
+  local file, file_err = current_file(source_bufnr)
+  local cursor, cursor_err = position(source_bufnr)
+  if not file or not cursor then
+    vim.notify(file_err or cursor_err, vim.log.levels.ERROR)
+    return
+  end
+  local content = buffer_content(source_bufnr)
+  local selection_start = opts.selection_start
+  local selection_end = opts.selection_end
+  if opts.use_visual_selection then
+    selection_start, selection_end = visual_selection(source_bufnr)
+  end
+  local prompt_bufnr = vim.api.nvim_create_buf(false, true)
+  vim.bo[prompt_bufnr].buftype = "prompt"
+  vim.fn.prompt_setprompt(prompt_bufnr, "> ")
+  local width = math.max(30, math.min(80, vim.o.columns - 6))
+  local winid = vim.api.nvim_open_win(prompt_bufnr, true, {
+    relative = "editor",
+    row = math.max(1, math.floor(vim.o.lines / 3)),
+    col = math.max(0, math.floor((vim.o.columns - width) / 2)),
+    width = width,
+    height = 1,
+    style = "minimal",
+    border = "rounded",
+    title = " Harnessd Example ",
+    title_pos = "center",
+  })
+  prompt = { bufnr = prompt_bufnr, winid = winid }
+
+  local function submit()
+    local value = vim.api.nvim_buf_get_lines(prompt_bufnr, 0, 1, false)[1] or ""
+    value = value:gsub("^> ", "")
+    if value:match("^%s*$") then
+      vim.notify("example prompt must not be empty", vim.log.levels.WARN)
+      return
+    end
+    close_prompt()
+    M.thread_example({
+      thread_id = thread.thread_id,
+      workspace = workspace(),
+      file = file,
+      offset = cursor.offset,
+      content = content,
+      prompt = value,
+      selection_start = selection_start,
+      selection_end = selection_end,
+      model = opts.model or M.model_for("scratch", source_bufnr),
+      reasoning_effort = opts.reasoning_effort or M.reasoning_effort_for("scratch", source_bufnr),
+    }, function(response, err)
+      if err then
+        vim.notify(err, vim.log.levels.ERROR)
+        callback(nil, err)
+        return
+      end
+      local result = (response or {}).result or {}
+      if result.thread then
+        set_active_thread(result.thread, source_bufnr)
+        mark_threads(source_bufnr, { result.thread })
+        render_thread_examples(result.thread)
+      end
+      if result.example and result.example.relative_path then
+        vim.notify("harnessd example: " .. result.example.relative_path, vim.log.levels.INFO)
+      end
+      callback(response, nil)
+    end)
+  end
+
+  vim.keymap.set("i", "<CR>", submit, { buffer = prompt_bufnr, nowait = true })
+  vim.keymap.set({ "i", "n" }, "<Esc>", M.dismiss, { buffer = prompt_bufnr, nowait = true })
+  vim.cmd("startinsert")
 end
 
 function M.scratch_ask(opts, callback)
@@ -1666,10 +2235,10 @@ function M.thread_ask(opts, callback)
       end
       local result = (response or {}).result or {}
       if result.thread then
+        set_active_thread(result.thread, source_bufnr)
         mark_threads(source_bufnr, { result.thread })
       end
       ensure_sidebar()
-      M.sidebar_refresh({ bufnr = source_bufnr })
       if result.launch then
         launch_codex(result.launch)
         vim.defer_fn(function()
@@ -1680,10 +2249,13 @@ function M.thread_ask(opts, callback)
           }, function(resolve_response)
             local resolved_thread = (((resolve_response or {}).result or {}).thread)
             if resolved_thread then
+              set_active_thread(resolved_thread, source_bufnr)
               mark_threads(source_bufnr, { resolved_thread })
             end
           end)
         end, 1500)
+      elseif result.thread then
+        render_thread_examples(result.thread)
       end
       callback(response, nil)
     end)
@@ -1698,8 +2270,8 @@ function M.thread_open_current()
   local bufnr = vim.api.nvim_get_current_buf()
   local cursor = vim.api.nvim_win_get_cursor(0)
   for _, thread in ipairs(current_threads[bufnr] or {}) do
-    if thread.current_line == cursor[1] and thread.codex_session_id then
-      launch_session({ id = thread.codex_session_id, cwd = thread.workspace }, nil)
+    if thread.current_line == cursor[1] then
+      open_thread_panel(thread, bufnr)
       return
     end
   end
@@ -1743,87 +2315,121 @@ function M.setup(opts)
     complete = "dir",
   })
 
-  vim.api.nvim_create_user_command("HarnessdCompleteDebug", function()
-    M.complete({}, function(response, err)
-      if err then
-        vim.notify(err, vim.log.levels.ERROR)
-        return
-      end
-
-      local suggestions = (((response or {}).result or {}).suggestions) or {}
-      vim.notify(vim.inspect(suggestions), vim.log.levels.INFO)
-    end)
-  end, {})
-  vim.api.nvim_create_user_command("HarnessdAsk", function() M.thread_ask() end, {})
-  vim.api.nvim_create_user_command("HarnessdInline", function() M.inline_ask() end, {})
+  vim.api.nvim_create_user_command("HarnessdPanel", function() M.panel() end, {})
+  vim.api.nvim_create_user_command("HarnessdPanelFlip", function() M.panel_flip() end, {})
+  vim.api.nvim_create_user_command("HarnessdExample", function(command)
+    M.example_ask({ use_visual_selection = command.range and command.range > 0 })
+  end, { range = true })
+  vim.api.nvim_create_user_command("HarnessdAsk", function() M.panel() end, {})
   vim.api.nvim_create_user_command("HarnessdScratch", function(command)
     M.scratch_ask({ use_visual_selection = command.range and command.range > 0 })
   end, { range = true })
-  vim.api.nvim_create_user_command("HarnessdThreads", function() M.sidebar_toggle() end, {})
+  vim.api.nvim_create_user_command("HarnessdThreads", function()
+    ensure_sidebar()
+    M.sidebar_refresh({ all = true })
+  end, {})
+  vim.api.nvim_create_user_command("HarnessdMarks", function()
+    ensure_sidebar()
+    M.sidebar_refresh({ all = true })
+  end, {})
+  vim.api.nvim_create_user_command("HarnessdMarkNext", function() M.mark_next_current() end, {})
+  vim.api.nvim_create_user_command("HarnessdMarkPrev", function() M.mark_prev_current() end, {})
   vim.api.nvim_create_user_command("HarnessdThreadOpen", function() M.thread_open_current() end, {})
   vim.api.nvim_create_user_command("HarnessdThreadAttach", function() M.thread_attach_current() end, {})
-  vim.api.nvim_create_user_command("HarnessdComplete", function() M.preview_complete() end, {})
   vim.api.nvim_create_user_command("HarnessdSettings", function() M.open_settings() end, {})
   vim.api.nvim_create_user_command("HarnessdModels", function() M.open_settings() end, {})
-  vim.api.nvim_create_user_command("HarnessdInlineComplete", function()
-    M.inline_complete({ silent = false })
-  end, {})
-  vim.api.nvim_create_user_command("HarnessdPrepareContext", function()
-    M.prepare_inline({ force = true }, function(_, err)
-      if err then
-        vim.notify(err, vim.log.levels.WARN)
-      end
-    end)
-  end, {})
   vim.api.nvim_create_user_command("HarnessdAccept", function() M.accept() end, {})
   vim.api.nvim_create_user_command("HarnessdDismiss", function() M.dismiss() end, {})
+
+  if config.legacy_autocomplete then
+    vim.api.nvim_create_user_command("HarnessdCompleteDebug", function()
+      M.complete({}, function(response, err)
+        if err then
+          vim.notify(err, vim.log.levels.ERROR)
+          return
+        end
+
+        local suggestions = (((response or {}).result or {}).suggestions) or {}
+        vim.notify(vim.inspect(suggestions), vim.log.levels.INFO)
+      end)
+    end, {})
+    vim.api.nvim_create_user_command("HarnessdInline", function() M.inline_ask() end, {})
+    vim.api.nvim_create_user_command("HarnessdComplete", function() M.preview_complete() end, {})
+    vim.api.nvim_create_user_command("HarnessdInlineComplete", function()
+      M.inline_complete({ silent = false })
+    end, {})
+    vim.api.nvim_create_user_command("HarnessdPrepareContext", function()
+      M.prepare_inline({ force = true }, function(_, err)
+        if err then
+          vim.notify(err, vim.log.levels.WARN)
+        end
+      end)
+    end, {})
+  end
 
   sign_define()
   vim.api.nvim_create_autocmd({ "BufEnter", "BufReadPost" }, {
     group = vim.api.nvim_create_augroup("harnessd_threads", { clear = true }),
     callback = function(event)
       M.refresh_thread_marks(event.buf)
+      M.refresh_marks(event.buf)
     end,
   })
-  vim.api.nvim_create_autocmd({ "BufEnter", "BufReadPost" }, {
-    group = vim.api.nvim_create_augroup("harnessd_context_prepare", { clear = true }),
-    callback = function(event)
-      M.prepare_inline({ bufnr = event.buf }, function() end)
-    end,
-  })
+  if config.legacy_autocomplete then
+    vim.api.nvim_create_autocmd({ "BufEnter", "BufReadPost" }, {
+      group = vim.api.nvim_create_augroup("harnessd_context_prepare", { clear = true }),
+      callback = function(event)
+        M.prepare_inline({ bufnr = event.buf }, function() end)
+      end,
+    })
 
-  vim.api.nvim_create_autocmd({ "InsertEnter", "TextChangedI", "CursorMovedI" }, {
-    group = vim.api.nvim_create_augroup("harnessd_auto_inline", { clear = true }),
-    callback = function()
-      M.schedule_auto_inline()
-    end,
-  })
-  vim.api.nvim_create_autocmd("InsertLeave", {
-    group = vim.api.nvim_create_augroup("harnessd_auto_inline_cleanup", { clear = true }),
-    callback = function()
-      stop_auto_inline_timer()
-      last_auto_inline_key = nil
-      clear_preview()
-    end,
-  })
+    vim.api.nvim_create_autocmd({ "InsertEnter", "TextChangedI", "CursorMovedI" }, {
+      group = vim.api.nvim_create_augroup("harnessd_auto_inline", { clear = true }),
+      callback = function()
+        M.schedule_auto_inline()
+      end,
+    })
+    vim.api.nvim_create_autocmd("InsertLeave", {
+      group = vim.api.nvim_create_augroup("harnessd_auto_inline_cleanup", { clear = true }),
+      callback = function()
+        stop_auto_inline_timer()
+        last_auto_inline_key = nil
+        clear_preview()
+      end,
+    })
+  end
 
-  vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdAsk)", function() M.thread_ask() end)
-  vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdInline)", function() M.inline_ask() end)
-  vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdInlineComplete)", function() M.inline_complete() end)
-  vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdPrepareContext)", function()
-    M.prepare_inline({ force = true }, function() end)
-  end)
+  vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdPanel)", function() M.panel() end)
+  vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdAsk)", function() M.panel() end)
+  vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdPanelFlip)", function() M.panel_flip() end)
+  vim.keymap.set({ "n", "i", "v" }, "<Plug>(HarnessdExample)", function() M.example_ask() end)
   vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdScratch)", function() M.scratch_ask() end)
   vim.keymap.set("v", "<Plug>(HarnessdScratch)", function() M.scratch_ask({ use_visual_selection = true }) end)
-  vim.keymap.set("n", "<Plug>(HarnessdThreads)", function() M.sidebar_toggle() end)
+  vim.keymap.set("n", "<Plug>(HarnessdThreads)", function()
+    ensure_sidebar()
+    M.sidebar_refresh({ all = true })
+  end)
+  vim.keymap.set("n", "<Plug>(HarnessdMarks)", function()
+    ensure_sidebar()
+    M.sidebar_refresh({ all = true })
+  end)
+  vim.keymap.set("n", "<Plug>(HarnessdMarkNext)", function() M.mark_next_current() end)
+  vim.keymap.set("n", "<Plug>(HarnessdMarkPrev)", function() M.mark_prev_current() end)
   vim.keymap.set("n", "<Plug>(HarnessdThreadOpen)", function() M.thread_open_current() end)
   vim.keymap.set("n", "<Plug>(HarnessdThreadAttach)", function() M.thread_attach_current() end)
-  vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdComplete)", function() M.preview_complete() end)
   vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdSettings)", function() M.open_settings() end)
   vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdModels)", function() M.open_settings() end)
   vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdAccept)", function() M.accept() end)
   vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdAcceptLine)", function() M.accept_line() end)
   vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdDismiss)", function() M.dismiss() end)
+  if config.legacy_autocomplete then
+    vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdInline)", function() M.inline_ask() end)
+    vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdInlineComplete)", function() M.inline_complete() end)
+    vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdPrepareContext)", function()
+      M.prepare_inline({ force = true }, function() end)
+    end)
+    vim.keymap.set({ "n", "i" }, "<Plug>(HarnessdComplete)", function() M.preview_complete() end)
+  end
 end
 
 return M

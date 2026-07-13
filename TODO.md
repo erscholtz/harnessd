@@ -1,85 +1,93 @@
-# TODO: Inline Autocomplete Refactor
+# TODO: Non-Interfering Scratchpad And Whiteboard
 
-Goal: make inline autocomplete behave like a fast ghost-text provider, similar to Kilo Code: editor requests must return quickly from local state/cache, while model work happens through prepared sessions and background refreshes.
+Goal: make `harnessd` a Neovim-first scratchpad and text whiteboard that can
+anchor notes and optional threads to source locations without letting Codex
+write to the project directory.
 
-## Current shape
+## Product Contract
 
-- `inline` is an explicit slow model call in `src/ipc/methods.rs`.
-- `inline.fast` is the right editor-facing direction: live buffer in, cache lookup first, optional background refresh on miss.
-- `complete` and `inline.fast` currently share `complete_from_content`, which makes saved-file completion and live-buffer inline autocomplete harder to reason about separately.
-- ACP inline generation is already bounded in `src/acp.rs`; keep that guardrail.
+- Codex must not edit or write inside the project tree.
+- Codex receives only current context by default: current file/selection plus
+  explicitly requested context.
+- Scratch artifacts are written outside the project tree.
+- Marks are external metadata and can exist without threads.
+- Threads attach to marks and own their scratch artifacts.
+- Deleting a thread deletes its scratch files.
+- Deleting a mark with an attached thread prompts before deleting both.
 
-## Refactor plan
+## Roadmap
 
-1. [x] Create a dedicated autocomplete module.
-   - Add `src/autocomplete.rs`.
-   - Move live-buffer autocomplete orchestration out of `src/ipc/methods.rs`.
-   - Keep JSON-RPC request parsing in `ipc/methods.rs`; call into the new module for behavior.
+1. [x] Documentation pivot.
+   - Rewrite README, TODO, AGENTS, and integration docs around the new
+     scratchpad/whiteboard direction.
+   - Mark legacy autocomplete and completion surfaces as removal targets.
 
-2. [ ] Split saved-file completion from live-buffer inline autocomplete.
-   - Keep `complete(file, offset, prefix)` as the saved-file/cache inspection path.
-   - Make `inline.fast` use a live-buffer-specific lookup function.
-   - Avoid coupling ghost-text behavior to disk reads.
+2. [x] Move scratch storage outside the project tree.
+   - Default to `~/.local/share/harnessd/scratch/<workspace-hash>/<thread-id>/`
+     on Unix.
+   - Default to `%LOCALAPPDATA%\harnessd\scratch\<workspace-hash>\<thread-id>\`
+     on Windows.
+   - Stop writing new artifacts under workspace-local scratch directories.
 
-3. [~] Define a single live autocomplete pipeline.
-   - Validate cursor offset against live content.
-   - Parse live content with tree-sitter.
-   - Resolve a stable region around the cursor.
-   - Look up bounded cached proposals by stable region key.
-   - Apply prefix filtering.
-   - Return the first usable suggestion immediately.
-   - On miss, optionally queue a deduped background refresh.
+3. [x] Add a settings-page toggle for scratch storage.
+   - Support `runtime` durable storage as the default.
+   - Support `temp` storage under the OS temp directory.
+   - Persist the selected storage mode through daemon-owned settings.
 
-4. [ ] Make region/key behavior explicit.
-   - Prefer TODO/FIXME/comment anchors when the cursor is inside their context.
-   - Fall back to enclosing function when available.
-   - Fall back to a bounded cursor window only for refresh dedupe, not broad proposal reuse.
-   - Include file path, byte range, content hash, prompt, model, and reasoning effort in refresh dedupe keys.
+4. [x] Add an independent external mark store.
+   - Introduce `Mark` records with `mark_id`, workspace, file, current line,
+     byte offset, line hash, optional `thread_id`, and status.
+   - Reanchor marks from line hashes and live buffer content.
+   - Keep marks out of source files.
 
-5. [x] Keep model generation off the hot path.
-   - `inline.fast` must not await ACP/model generation.
-   - `inline.prepare` should warm reusable ACP sessions for a workspace/file.
-   - Background refresh stores capped snippets in the proposal cache for future requests.
-   - Preserve max-lines and max-bytes enforcement before anything enters the cache.
+5. [x] Attach threads to marks.
+   - Convert thread creation to attach to an existing or newly created mark.
+   - Let marks exist without threads.
+   - Keep thread metadata separate from mark identity.
 
-6. [ ] Clarify method roles.
-   - `inline.fast`: editor ghost-text provider.
-   - `inline.prepare`: optional prewarm when an editor opens/focuses a file.
-   - `inline`: explicit command/palette "ask at cursor", not keystroke autocomplete.
-   - `complete`: saved-file/debug/cache completion path.
+6. [~] Build the mark/thread menu and mark cycling.
+   - List marks and show attached thread state.
+   - Cycle previous/next marks from the source buffer.
+   - Jump from panel items back to source.
+   - RPC, CLI, Neovim mark browsing, and Neovim mark cycling exist.
+   - The panel still needs a fuller mark-first scratchpad view instead of the
+     transitional thread-first behavior.
 
-7. [ ] Update editor bridge docs after the code move.
-   - Document that integrations should call `inline.fast` for inline autocomplete.
-   - Document that live buffer content is required on stdin for bridge calls.
-   - Warn users to disable competing inline providers if ghost text conflicts.
+7. [~] Add thread deletion with guarded scratch cleanup.
+   - Delete a thread's scratch directory when the thread is removed.
+   - Prompt before deleting a mark that has an attached thread.
+   - Guard recursive deletion so only configured harnessd scratch roots can be
+     removed.
+   - Backend deletion and guard are implemented; explicit Neovim deletion UI
+     confirmation still needs wiring.
 
-8. [ ] Add focused tests.
-   - `inline.fast` returns cache hits without queueing refresh.
-   - `inline.fast` queues at most one equivalent refresh on repeated misses.
-   - Refresh keys change when region content changes.
-   - Prefix filtering applies to live autocomplete.
-   - Oversized ACP output is rejected and never cached.
-   - `inline` remains usable as an explicit slow command.
+8. [ ] Remove legacy code-assist surfaces.
+   - Remove autocomplete, ghost-text preview, inline completion, ACP generation,
+     LSP completion, Zed autocomplete, and proposal cache product paths.
+   - Keep compatibility shims only when needed for a short migration window.
 
-## Suggested implementation order
+9. [~] Add focused tests.
+   - Read-only/current-context request shape.
+   - Scratch path safety outside the project tree.
+   - Runtime-vs-temp scratch storage selection.
+   - Thread deletion and scratch cleanup.
+   - Mark creation, reanchoring, cycling, and thread attachment.
+   - Backend and Neovim headless coverage exists for the implemented pieces.
 
-1. [x] Add `src/autocomplete.rs` and move helper functions with no behavior change.
-2. [ ] Add tests around existing behavior before changing contracts.
-3. [ ] Rename internal functions to distinguish saved-file completion from live autocomplete.
-4. [x] Route `inline.fast` through the new module.
-5. [ ] Tighten docs and integration examples.
-6. [x] Run `cargo test`.
+## Target API And CLI Direction
 
-## Progress notes
+These names describe implementation direction, not a guarantee that the current
+binary already exposes them:
 
-- 2026-06-05: Added `src/autocomplete.rs` and moved `inline`, `inline.fast`, `inline.prepare`, cursor context construction, live-buffer validation, and background inline refresh orchestration out of `src/ipc/methods.rs`.
-- 2026-06-05: `ipc/methods.rs` now remains responsible for JSON-RPC handling plus shared cache/anchor helpers; `inline.fast` behavior is still intentionally unchanged.
-- 2026-06-05: `cargo check` passes after the module split.
-- 2026-06-05: `cargo fmt --check` and `cargo test` pass.
+- `mark.create`, `mark.list`, `mark.delete`, `mark.next`, `mark.prev`
+- `thread.create`, `thread.list`, `thread.delete`, `thread.attach`
+- `scratch.create`, `scratch.list`, `scratch.delete`
+- `settings.get`, `settings.update`
 
-## Non-goals for this slice
+## Non-Goals
 
-- Do not add research, vector indexing, or tmux workflows.
-- Do not make autocomplete wait on network/model generation.
-- Do not return uncapped model output as ghost text.
-- Do not refactor unrelated CLI, TUI, scratch, or agent features.
+- Do not reintroduce AI writes to project files.
+- Do not add new autocomplete, ghost-text, inline, or LSP completion work.
+- Do not make Zed autocomplete part of the new product direction.
+- Do not insert marker comments into source files.
+- Do not document workspace-local scratch directories as target behavior.
